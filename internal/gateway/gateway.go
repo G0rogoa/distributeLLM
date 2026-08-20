@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,8 @@ import (
 
 	"distserve/internal/admission"
 	"distserve/internal/api"
+	"distserve/internal/backend"
+	"distserve/internal/cache"
 	"distserve/internal/lifecycle"
 	"distserve/internal/registry"
 	"distserve/internal/scheduler"
@@ -24,18 +27,25 @@ import (
 )
 
 type Gateway struct {
-	backendURL string
-	model      string
-	timeout    time.Duration
-	client     *http.Client
-	log        *slog.Logger
-	sequence   atomic.Uint64
-	registry   *registry.Registry
-	scheduler  scheduler.Scheduler
-	admission  *admission.Limiter
-	requests   *lifecycle.Store
-	retry      bool
-	metrics    *telemetry.Metrics
+	backendURL       string
+	model            string
+	timeout          time.Duration
+	client           *http.Client
+	log              *slog.Logger
+	sequence         atomic.Uint64
+	registry         *registry.Registry
+	scheduler        scheduler.Scheduler
+	admission        *admission.Limiter
+	requests         *lifecycle.Store
+	retry            bool
+	metrics          *telemetry.Metrics
+	cacheRuntime     *cache.Runtime
+	fillReservations *cache.FillReservations
+}
+
+func (g *Gateway) ConfigureCache(runtime *cache.Runtime, fills *cache.FillReservations) {
+	g.cacheRuntime = runtime
+	g.fillReservations = fills
 }
 
 func NewDynamic(workerRegistry *registry.Registry, strategy scheduler.Scheduler, model string, timeout time.Duration, maxInFlight int, retry bool, client *http.Client, logger *slog.Logger) *Gateway {
@@ -66,11 +76,23 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("GET /internal/debug/requests", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, g.requests.Snapshot())
 	})
+	mux.HandleFunc("GET /internal/cache/requests/{id}", func(w http.ResponseWriter, r *http.Request) {
+		request, ok := g.requests.Find(r.PathValue("id"))
+		if !ok {
+			writeError(w, http.StatusNotFound, "not_found", "request_not_found", "request not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"snapshot_time": time.Now(), "stale_possible": true, "request": request})
+	})
 	var snapshots func() []registry.WorkerSnapshot
 	if g.registry != nil {
 		snapshots = g.registry.Snapshots
 	}
-	mux.HandleFunc("GET /metrics", g.metrics.Handler(snapshots))
+	var cacheStats func() cache.CacheStats
+	if g.cacheRuntime != nil && g.cacheRuntime.Index != nil {
+		cacheStats = g.cacheRuntime.Index.Stats
+	}
+	mux.HandleFunc("GET /metrics", g.metrics.Handler(snapshots, cacheStats))
 	return mux
 }
 
@@ -126,10 +148,20 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), g.timeout)
 	defer cancel()
 	record.InputTokens = approximateInputTokens(input.Messages)
-	body, err := json.Marshal(input)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "server_error", "encode_failed", "failed to encode request")
-		return
+	var features *cache.RequestFeatures
+	var err error
+	if g.cacheRuntime != nil {
+		messages := make([]cache.PromptMessage, len(input.Messages))
+		for i, message := range input.Messages {
+			messages[i] = cache.PromptMessage{Role: message.Role, Content: message.Content}
+		}
+		features, err = g.cacheRuntime.Prepare(ctx, messages)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", "prompt_processing_failed", err.Error())
+			return
+		}
+		record.InputTokens = features.TotalInputTokens
+		record.CacheFullBlocks = len(features.PrefixBlocks)
 	}
 	var resp *http.Response
 	var release func()
@@ -139,7 +171,7 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		maxAttempts = 2
 	}
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		backendURL, decision, selectedRelease, selectErr := g.selectWorker(ctx, requestID, input, started)
+		backendURL, decision, selectedRelease, selectErr := g.selectWorker(ctx, requestID, input, started, features)
 		if selectErr != nil {
 			err = selectErr
 			scheduleFailed = true
@@ -148,8 +180,34 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		release = selectedRelease
 		record.ScheduledAt = time.Now()
 		record.SelectedWorker, record.SelectedInstance, record.SchedulerStrategy = decision.WorkerID, decision.InstanceID, decision.Strategy
+		record.CachePredictedBlocks, record.CachePredictedTokens = decision.CacheMatch.MatchedBlocks, decision.CacheMatch.MatchedTokens
+		record.CacheViewState = string(decision.CacheMatch.CacheViewState)
+		transport := backend.ChatCompletionRequest{ChatCompletionRequest: input}
+		if features != nil {
+			transport.CacheHint = &cache.RoutingHint{Identity: features.Identity, PrefixBlocks: features.PrefixBlocks, TotalInputTokens: features.TotalInputTokens, PredictedMatchedBlocks: decision.CacheMatch.MatchedBlocks, PredictedMatchedTokens: decision.CacheMatch.MatchedTokens}
+		}
+		body, marshalErr := json.Marshal(transport)
+		if marshalErr != nil {
+			release()
+			err = marshalErr
+			break
+		}
+		var releaseFill func()
+		if g.fillReservations != nil && features != nil && len(features.PrefixBlocks) > 0 && decision.CacheMatch.MatchedBlocks < len(features.PrefixBlocks) {
+			identityHash, hashErr := features.Identity.Hash()
+			if hashErr == nil {
+				last := features.PrefixBlocks[len(features.PrefixBlocks)-1]
+				if done, ok := g.fillReservations.Reserve(cache.CacheKey{IdentityHash: identityHash, PrefixHash: last.PrefixHash}, cache.WorkerInstanceKey{WorkerID: decision.WorkerID, InstanceID: decision.InstanceID}, requestID); ok {
+					releaseFill = done
+					record.CacheFillReserved = true
+				}
+			}
+		}
 		upstream, requestErr := http.NewRequestWithContext(ctx, http.MethodPost, backendURL+"/v1/chat/completions", bytes.NewReader(body))
 		if requestErr != nil {
+			if releaseFill != nil {
+				releaseFill()
+			}
 			release()
 			err = requestErr
 			break
@@ -160,6 +218,9 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			upstream.Header.Set("X-DistServe-Worker-ID", decision.WorkerID)
 		}
 		resp, err = g.client.Do(upstream)
+		if releaseFill != nil {
+			releaseFill()
+		}
 		record.ForwardedAt = time.Now()
 		retryable := err != nil || (resp != nil && resp.StatusCode == http.StatusServiceUnavailable)
 		if !retryable || attempt+1 == maxAttempts || ctx.Err() != nil {
@@ -194,6 +255,14 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 	defer resp.Body.Close()
+	record.CacheActualBlocks = parseNonNegativeHeader(resp.Header.Get("X-DistServe-Actual-Hit-Blocks"))
+	record.CacheActualTokens = parseNonNegativeHeader(resp.Header.Get("X-DistServe-Actual-Hit-Tokens"))
+	record.CachePredictionMiss = record.CacheActualBlocks < record.CachePredictedBlocks
+	g.metrics.CachePredictedTokens.Add(int64(record.CachePredictedTokens))
+	g.metrics.CacheActualTokens.Add(int64(record.CacheActualTokens))
+	if record.CachePredictionMiss {
+		g.metrics.CachePredictionMisses.Add(1)
+	}
 	if resp.StatusCode != http.StatusOK {
 		g.metrics.Errors.Add(1)
 		w.Header().Set("Content-Type", "application/json")
@@ -230,17 +299,33 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	g.logResult(requestID, started, firstToken, err)
 }
 
-func (g *Gateway) selectWorker(ctx context.Context, requestID string, input api.ChatCompletionRequest, arrival time.Time) (string, scheduler.Decision, func(), error) {
+func (g *Gateway) selectWorker(ctx context.Context, requestID string, input api.ChatCompletionRequest, arrival time.Time, features *cache.RequestFeatures) (string, scheduler.Decision, func(), error) {
 	if g.registry == nil || g.scheduler == nil {
 		return g.backendURL, scheduler.Decision{}, func() {}, nil
 	}
-	meta := scheduler.RequestMeta{RequestID: requestID, Model: input.Model, InputTokens: approximateInputTokens(input.Messages), MaxOutputTokens: input.MaxTokens, Streaming: input.Stream, ArrivalTime: arrival}
+	meta := scheduler.RequestMeta{RequestID: requestID, Model: input.Model, InputTokens: approximateInputTokens(input.Messages), MaxOutputTokens: input.MaxTokens, Streaming: input.Stream, ArrivalTime: arrival, Cache: features}
 	if deadline, ok := ctx.Deadline(); ok {
 		meta.Deadline = deadline
 	}
 	// A worker may change instance between snapshot and commit. Re-snapshot once.
 	for attempt := 0; attempt < 2; attempt++ {
 		snapshots := g.registry.Snapshots()
+		if features != nil && g.cacheRuntime != nil && g.cacheRuntime.Index != nil {
+			features.Matches = make(map[cache.WorkerInstanceKey]cache.PrefixMatch, len(snapshots))
+			features.FillAffinity = make(map[cache.WorkerInstanceKey]bool, len(snapshots))
+			var affinity cache.WorkerInstanceKey
+			if g.fillReservations != nil && len(features.PrefixBlocks) > 0 {
+				identityHash, hashErr := features.Identity.Hash()
+				if hashErr == nil {
+					affinity, _ = g.fillReservations.Affinity(cache.CacheKey{IdentityHash: identityHash, PrefixHash: features.PrefixBlocks[len(features.PrefixBlocks)-1].PrefixHash})
+				}
+			}
+			for _, worker := range snapshots {
+				key := cache.WorkerInstanceKey{WorkerID: worker.ID, InstanceID: worker.InstanceID}
+				features.Matches[key] = g.cacheRuntime.Index.Match(key, features.Identity, features.PrefixBlocks, features.TotalInputTokens, time.Now())
+				features.FillAffinity[key] = key == affinity
+			}
+		}
 		decision, err := g.scheduler.Select(ctx, meta, snapshots)
 		if err != nil {
 			g.metrics.SchedulerFailures.Add(1)
@@ -275,6 +360,14 @@ func approximateInputTokens(messages []api.Message) int {
 		return 0
 	}
 	return (characters + 3) / 4
+}
+
+func parseNonNegativeHeader(value string) int {
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 0 {
+		return 0
+	}
+	return parsed
 }
 
 func proxySSE(w http.ResponseWriter, body io.Reader) (time.Time, error) {

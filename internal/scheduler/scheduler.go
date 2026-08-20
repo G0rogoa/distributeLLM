@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"distserve/internal/cache"
 	"distserve/internal/registry"
 )
 
@@ -23,15 +24,23 @@ type RequestMeta struct {
 	ArrivalTime     time.Time
 	Deadline        time.Time
 	TenantID        string
+	Cache           *cache.RequestFeatures
 }
 
 type Decision struct {
-	WorkerID    string
-	InstanceID  string
-	Strategy    string
-	Score       float64
-	Reason      string
-	SnapshotAge time.Duration
+	WorkerID     string
+	InstanceID   string
+	Strategy     string
+	Score        float64
+	Reason       string
+	SnapshotAge  time.Duration
+	CacheMatch   cache.PrefixMatch
+	ScoreDetails ScoreBreakdown
+}
+
+type ScoreBreakdown struct {
+	MatchedTokens                                                                                                                                            int
+	CacheBenefit, RunningPenalty, QueuePenalty, ReservationPenalty, RemainingTokensPenalty, StalenessPenalty, CapacityPenalty, FillAffinityBonus, FinalScore float64
 }
 
 type Scheduler interface {
@@ -61,6 +70,63 @@ type LeastLoaded struct {
 	TokenWeight float64
 	mu          sync.Mutex
 	next        uint64
+}
+
+type PrefixAware struct {
+	CacheWeight, LoadWeight, StalenessWeight, RunningWeight, ReservationWeight, QueueWeight, RemainingTokenWeight, PrefillMSPerToken, DegradedPenalty, FillAffinityBonus float64
+	mu                                                                                                                                                                   sync.Mutex
+	next                                                                                                                                                                 uint64
+}
+
+func (s *PrefixAware) Name() string { return "prefix-aware" }
+func (s *PrefixAware) Select(ctx context.Context, request RequestMeta, workers []registry.WorkerSnapshot) (Decision, error) {
+	if err := ctx.Err(); err != nil {
+		return Decision{}, err
+	}
+	candidates := eligible(request.Model, workers)
+	if len(candidates) == 0 {
+		return Decision{}, ErrNoWorker
+	}
+	bestScore := 0.0
+	best := make([]Decision, 0)
+	for _, worker := range candidates {
+		key := cache.WorkerInstanceKey{WorkerID: worker.ID, InstanceID: worker.InstanceID}
+		match := cache.PrefixMatch{}
+		affinity := false
+		if request.Cache != nil {
+			match = request.Cache.Matches[key]
+			affinity = request.Cache.FillAffinity[key]
+		}
+		details := ScoreBreakdown{MatchedTokens: match.MatchedTokens}
+		details.CacheBenefit = float64(match.MatchedTokens) * s.PrefillMSPerToken
+		details.RunningPenalty = float64(worker.ReportedRunning) * s.RunningWeight
+		details.ReservationPenalty = float64(worker.LocalReservations) * s.ReservationWeight
+		details.QueuePenalty = float64(worker.ReportedQueued) * s.QueueWeight
+		details.RemainingTokensPenalty = float64(worker.EstimatedRemainingTokens) * s.RemainingTokenWeight
+		if match.CacheViewState == cache.CacheViewDegraded {
+			details.StalenessPenalty = s.DegradedPenalty
+		}
+		if affinity {
+			details.FillAffinityBonus = s.FillAffinityBonus
+		}
+		load := details.RunningPenalty + details.ReservationPenalty + details.QueuePenalty + details.RemainingTokensPenalty + details.CapacityPenalty
+		details.FinalScore = s.CacheWeight*details.CacheBenefit - s.LoadWeight*load - s.StalenessWeight*details.StalenessPenalty + details.FillAffinityBonus
+		reason := fmt.Sprintf("selected %s: matched_tokens=%d, cache_benefit_ms=%.3f, load_penalty=%.3f, staleness_penalty=%.3f, fill_affinity=%.3f, final_score=%.3f", worker.ID, match.MatchedTokens, details.CacheBenefit, load, details.StalenessPenalty, details.FillAffinityBonus, details.FinalScore)
+		candidate := decision(s.Name(), worker, details.FinalScore, reason)
+		candidate.CacheMatch = match
+		candidate.ScoreDetails = details
+		if len(best) == 0 || details.FinalScore > bestScore {
+			best = []Decision{candidate}
+			bestScore = details.FinalScore
+		} else if details.FinalScore == bestScore {
+			best = append(best, candidate)
+		}
+	}
+	s.mu.Lock()
+	chosen := best[int(s.next%uint64(len(best)))]
+	s.next++
+	s.mu.Unlock()
+	return chosen, nil
 }
 
 func (s *LeastLoaded) Name() string { return "least-loaded" }

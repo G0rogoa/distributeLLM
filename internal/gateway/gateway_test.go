@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"distserve/internal/cache"
 	"distserve/internal/gateway"
 	"distserve/internal/mockworker"
 	"distserve/internal/registry"
@@ -27,6 +29,65 @@ func setup(t *testing.T, timeout, prefill, decode time.Duration) (*httptest.Serv
 	controller := httptest.NewServer(gateway.New(workerServer.URL, "mock-llm", timeout, nil, logger).Handler())
 	t.Cleanup(controller.Close)
 	return controller, worker
+}
+
+func TestPrefixCacheColdThenHotEndToEnd(t *testing.T) {
+	events := make(chan cache.CacheEvent, 100)
+	worker := mockworker.NewWithConfig(mockworker.Config{Model: "mock-llm", Capacity: 2, QueueCapacity: 2, PrefillPerToken: time.Millisecond, Seed: 1})
+	workerKey := cache.WorkerInstanceKey{WorkerID: "worker-1", InstanceID: "instance-1"}
+	if err := worker.EnableCache(workerKey, 1<<20, 4, time.Minute, 0, events); err != nil {
+		t.Fatal(err)
+	}
+	workerServer := httptest.NewServer(worker.Handler())
+	defer workerServer.Close()
+	workers := registry.New(time.Second, 2*time.Second)
+	if err := workers.Register(registry.Worker{ID: workerKey.WorkerID, InstanceID: workerKey.InstanceID, Address: workerServer.URL, Models: []string{"mock-llm"}, Capacity: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := workers.Heartbeat(workerKey.WorkerID, workerKey.InstanceID, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	index, _ := cache.NewCacheIndex(100, 100, time.Minute)
+	_ = index.SetWorkerInstance(workerKey.WorkerID, workerKey.InstanceID)
+	identity := cache.CacheIdentity{ProtocolVersion: cache.PrefixProtocolVersion, ModelID: "mock-llm", ModelRevision: "v1", TokenizerID: "mock", TokenizerRevision: "v1", ChatTemplateVersion: "chat-v1", BlockSizeTokens: 4, CacheFormatVersion: "mock-kv-v1"}
+	runtime := &cache.Runtime{Builder: cache.PromptBuilder{Identity: cache.PromptIdentity{ModelID: identity.ModelID, ModelRevision: identity.ModelRevision, TokenizerID: identity.TokenizerID, TokenizerRevision: identity.TokenizerRevision, ChatTemplateVersion: identity.ChatTemplateVersion}, MaxBytes: 1 << 20}, Tokenizer: &cache.DeterministicMockTokenizer{TokenizerID: cache.TokenizerIdentity{ID: "mock", Revision: "v1"}, MaxInputBytes: 1 << 20, MaxTokens: 1000}, Identity: identity, Index: index}
+	strategy := &scheduler.PrefixAware{CacheWeight: 1, LoadWeight: 1, PrefillMSPerToken: 1}
+	gw := gateway.NewDynamic(workers, strategy, "mock-llm", 2*time.Second, 8, false, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	gw.ConfigureCache(runtime, cache.NewFillReservations(time.Minute))
+	controller := httptest.NewServer(gw.Handler())
+	defer controller.Close()
+	body := `{"model":"mock-llm","messages":[{"role":"user","content":"one two three four five six seven eight nine ten"}],"max_tokens":1,"stream":false}`
+	for request := 0; request < 2; request++ {
+		resp, err := http.Post(controller.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d status=%d", request, resp.StatusCode)
+		}
+		for len(events) > 0 {
+			if _, err := index.Apply(<-events); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	stats, _ := worker.CacheStats()
+	if stats.Hits == 0 {
+		t.Fatalf("second request did not reuse prefix: %+v", stats)
+	}
+	resp, err := http.Get(controller.URL + "/internal/debug/requests")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var records []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&records); err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || records[1]["cache_actual_tokens"].(float64) == 0 {
+		t.Fatalf("records=%v", records)
+	}
 }
 
 func TestDynamicSchedulingReleasesReservation(t *testing.T) {

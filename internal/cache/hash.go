@@ -15,22 +15,30 @@ type BlockHash [32]byte
 func (h BlockHash) String() string { return hex.EncodeToString(h[:]) }
 
 type CacheIdentity struct {
-	ProtocolVersion     string
-	ModelID             string
-	ModelRevision       string
-	TokenizerID         string
-	TokenizerRevision   string
-	ChatTemplateVersion string
-	AdapterID           string
-	BlockSizeTokens     int
-	CacheFormatVersion  string
+	ProtocolVersion     string `json:"protocol_version"`
+	ModelID             string `json:"model_id"`
+	ModelRevision       string `json:"model_revision"`
+	TokenizerID         string `json:"tokenizer_id"`
+	TokenizerRevision   string `json:"tokenizer_revision"`
+	ChatTemplateVersion string `json:"chat_template_version"`
+	AdapterID           string `json:"adapter_id,omitempty"`
+	BlockSizeTokens     int    `json:"block_size_tokens"`
+	CacheFormatVersion  string `json:"cache_format_version"`
 }
 
 type PrefixBlock struct {
-	Index      int
-	TokenCount int
-	PrefixHash BlockHash
-	ParentHash BlockHash
+	Index      int       `json:"index"`
+	TokenCount int       `json:"token_count"`
+	PrefixHash BlockHash `json:"prefix_hash"`
+	ParentHash BlockHash `json:"parent_hash"`
+}
+
+type RoutingHint struct {
+	Identity               CacheIdentity `json:"identity"`
+	PrefixBlocks           []PrefixBlock `json:"prefix_blocks"`
+	TotalInputTokens       int           `json:"total_input_tokens"`
+	PredictedMatchedBlocks int           `json:"predicted_matched_blocks"`
+	PredictedMatchedTokens int           `json:"predicted_matched_tokens"`
 }
 
 func (identity CacheIdentity) Validate() error {

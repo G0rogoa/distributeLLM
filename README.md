@@ -1,10 +1,12 @@
 # DistServe
 
 DistServe is a learning-oriented control plane for distributed LLM serving. The
-current Phase 1 implementation provides an OpenAI-compatible streaming gateway,
+Phase 2 provides an OpenAI-compatible streaming gateway,
 standalone heterogeneous mock workers, discovery and health tracking, round-robin and
 least-loaded scheduling, reservations, bounded admission, limited retry, metrics, and a
-Go load generator. It does not run a real model or require a GPU.
+Go load generator, deterministic token-block prefix hashing, a lease-based global
+cache metadata index, bounded Worker LRU simulation, and prefix-aware scheduling.
+It does not run a real model, store GPU KV tensors, or require a GPU.
 
 ## Run
 
@@ -36,9 +38,11 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 
 Inspect the registry with `curl http://127.0.0.1:8080/internal/workers`.
 
-Switch scheduling with `-scheduler=round-robin` or `-scheduler=least-loaded`. Enable
+Prefix-aware scheduling is the default. Switch with `-scheduler=round-robin` or
+`-scheduler=least-loaded`. Enable
 one safe pre-response retry with `-retry`. Metrics are at `/metrics`; recent bounded
-request lifecycle records are at `/internal/debug/requests`.
+request lifecycle records are at `/internal/debug/requests`. Cache views are at
+`/internal/cache/stats`, `/internal/cache/workers`, and `/internal/cache/prefixes/{hash}`.
 
 With Docker installed, `docker compose -f deployments/docker-compose.yml up --build`
 starts the Controller, three heterogeneous Workers, and Prometheus.
@@ -57,13 +61,13 @@ Run load generation with:
 go run ./cmd/loadgen -requests=100 -concurrency=8 -stream -format=json
 ```
 
-Reproducible benchmark commands are in `experiments/`; methodology is documented in
+Reproducible cache benchmark commands are in `experiments/cache-aware.sh`; methodology is documented in
 `docs/benchmark-methodology.md`. No performance numbers are checked in because this
 environment has no Docker installation and benchmark results must be measured.
 
 The API supports only `model`, `messages`, `max_tokens`, `temperature`, and `stream`.
 Registry and lifecycle state are in memory; internal APIs have no authentication;
 metrics use a small standard-library Prometheus exposition implementation; the mock
-worker is a timing simulator, not a model server. See `docs/future-phases.md` for KV
-cache-aware scheduling, real vLLM/SGLang adapters, prefill/decode separation, SLOs,
+worker is a timing simulator, not a model server. See `docs/future-phases.md` for real
+vLLM/SGLang adapters, prefill/decode separation, SLOs,
 and Kubernetes evolution.

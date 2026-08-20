@@ -6,11 +6,41 @@ import (
 	"testing"
 	"time"
 
+	"distserve/internal/cache"
 	"distserve/internal/registry"
 )
 
 func worker(id string, load, reservations int) registry.WorkerSnapshot {
 	return registry.WorkerSnapshot{ID: id, InstanceID: id + "-instance", Models: []string{"mock-llm"}, Status: registry.StatusHealthy, Capacity: 8, ReportedRunning: load, LocalReservations: reservations, LastHeartbeat: time.Now()}
+}
+
+func TestPrefixAwareTradesCacheBenefitAgainstLoad(t *testing.T) {
+	s := &PrefixAware{CacheWeight: 1, LoadWeight: 1, RunningWeight: 20, PrefillMSPerToken: 1}
+	a, b := worker("a", 2, 0), worker("b", 0, 0)
+	features := &cache.RequestFeatures{Matches: map[cache.WorkerInstanceKey]cache.PrefixMatch{
+		{WorkerID: a.ID, InstanceID: a.InstanceID}: {MatchedTokens: 100, MatchedBlocks: 5, CacheViewState: cache.CacheViewReady},
+	}}
+	got, err := s.Select(context.Background(), RequestMeta{Model: "mock-llm", Cache: features}, []registry.WorkerSnapshot{a, b})
+	if err != nil || got.WorkerID != "a" || got.ScoreDetails.CacheBenefit != 100 {
+		t.Fatalf("got=%+v err=%v", got, err)
+	}
+	a.ReportedRunning = 7
+	got, err = s.Select(context.Background(), RequestMeta{Model: "mock-llm", Cache: features}, []registry.WorkerSnapshot{a, b})
+	if err != nil || got.WorkerID != "b" {
+		t.Fatalf("load should win: got=%+v err=%v", got, err)
+	}
+}
+
+func TestPrefixAwarePenalizesDegradedAndHonorsFillAffinity(t *testing.T) {
+	s := &PrefixAware{CacheWeight: 1, StalenessWeight: 1, PrefillMSPerToken: 1, DegradedPenalty: 100, FillAffinityBonus: 10}
+	a, b := worker("a", 0, 0), worker("b", 0, 0)
+	features := &cache.RequestFeatures{Matches: map[cache.WorkerInstanceKey]cache.PrefixMatch{
+		{WorkerID: a.ID, InstanceID: a.InstanceID}: {MatchedTokens: 50, CacheViewState: cache.CacheViewDegraded},
+	}, FillAffinity: map[cache.WorkerInstanceKey]bool{{WorkerID: b.ID, InstanceID: b.InstanceID}: true}}
+	got, err := s.Select(context.Background(), RequestMeta{Model: "mock-llm", Cache: features}, []registry.WorkerSnapshot{a, b})
+	if err != nil || got.WorkerID != "b" || got.ScoreDetails.FillAffinityBonus != 10 {
+		t.Fatalf("got=%+v err=%v", got, err)
+	}
 }
 
 func TestRoundRobinAndChangingList(t *testing.T) {

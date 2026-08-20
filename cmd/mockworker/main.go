@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"distserve/internal/cache"
 	"distserve/internal/mockworker"
 )
 
@@ -28,14 +29,23 @@ func main() {
 	jitter := flag.Duration("jitter", 5*time.Millisecond, "maximum random latency jitter")
 	failureRate := flag.Float64("failure-rate", 0, "injected failure probability from 0 to 1")
 	seed := flag.Int64("seed", 1, "random seed; zero uses current time")
+	cacheCapacity := flag.Int64("cache-capacity-bytes", 512<<20, "mock KV cache capacity")
+	cacheBytesPerToken := flag.Int64("cache-bytes-per-token", 16384, "simulated cache bytes per token")
+	cacheLease := flag.Duration("cache-lease", 30*time.Second, "cache event lease")
+	cacheEventQueue := flag.Int("cache-event-queue", 1024, "bounded cache event queue")
 	flag.Parse()
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	instanceID := fmt.Sprintf("%s-%d-%d", *id, os.Getpid(), time.Now().UnixNano())
 	worker := mockworker.NewWithConfig(mockworker.Config{Model: "mock-llm", Capacity: *capacity, QueueCapacity: *queueCapacity, PrefillDelay: *prefill, PrefillPerToken: *prefillPerToken, DecodeInterval: *decode, ConcurrencyPenalty: *penalty, Jitter: *jitter, FailureRate: *failureRate, Seed: *seed})
+	events := make(chan cache.CacheEvent, *cacheEventQueue)
+	if err := worker.EnableCache(cache.WorkerInstanceKey{WorkerID: *id, InstanceID: instanceID}, *cacheCapacity, *cacheBytesPerToken, *cacheLease, 100*time.Microsecond, events); err != nil {
+		logger.Error("invalid cache configuration", "error", err)
+		os.Exit(2)
+	}
 	go func() {
-		err := worker.RunRegistration(ctx, mockworker.RegistrationConfig{ControllerURL: *controller, ID: *id, InstanceID: instanceID, Address: *advertise, Model: "mock-llm", Capacity: *capacity, Interval: 2 * time.Second}, nil)
+		err := worker.RunRegistration(ctx, mockworker.RegistrationConfig{ControllerURL: *controller, ID: *id, InstanceID: instanceID, Address: *advertise, Model: "mock-llm", Capacity: *capacity, Interval: 2 * time.Second, CacheEvents: events}, nil)
 		if err != nil && ctx.Err() == nil {
 			logger.Error("registration loop stopped", "error", err)
 		}

@@ -1,0 +1,13 @@
+{
+  "title": "DistServe Cache",
+  "uid": "distserve-cache",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "panels": [
+    {"type":"timeseries","title":"Predicted vs actual hit tokens","targets":[{"expr":"rate(distserve_cache_predicted_hit_tokens_total[1m])","legendFormat":"predicted"},{"expr":"rate(distserve_cache_actual_hit_tokens_total[1m])","legendFormat":"actual"}],"gridPos":{"x":0,"y":0,"w":12,"h":8}},
+    {"type":"timeseries","title":"Prediction misses and evictions","targets":[{"expr":"rate(distserve_cache_prediction_misses_total[1m])","legendFormat":"prediction miss"},{"expr":"sum(rate(distserve_mock_cache_evictions_total[1m]))","legendFormat":"eviction"}],"gridPos":{"x":12,"y":0,"w":12,"h":8}},
+    {"type":"timeseries","title":"Cache index entries","targets":[{"expr":"distserve_cache_entries","legendFormat":"entries"}],"gridPos":{"x":0,"y":8,"w":12,"h":8}},
+    {"type":"timeseries","title":"Event integrity","targets":[{"expr":"rate(distserve_cache_event_sequence_gaps_total[1m])","legendFormat":"gaps"},{"expr":"rate(distserve_cache_event_errors_total[1m])","legendFormat":"errors"}],"gridPos":{"x":12,"y":8,"w":12,"h":8}}
+  ]
+}

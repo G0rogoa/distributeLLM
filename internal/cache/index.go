@@ -45,19 +45,19 @@ type CacheKey struct {
 }
 
 type CacheEvent struct {
-	WorkerID      string
-	InstanceID    string
-	EventID       string
-	Sequence      uint64
-	Type          CacheEventType
-	Identity      CacheIdentity
-	PrefixHash    BlockHash
-	ParentHash    BlockHash
-	BlockIndex    int
-	TokenCount    int
-	SizeBytes     int64
-	ObservedAt    time.Time
-	LeaseDuration time.Duration
+	WorkerID      string         `json:"worker_id"`
+	InstanceID    string         `json:"instance_id"`
+	EventID       string         `json:"event_id"`
+	Sequence      uint64         `json:"sequence"`
+	Type          CacheEventType `json:"type"`
+	Identity      CacheIdentity  `json:"identity"`
+	PrefixHash    BlockHash      `json:"prefix_hash"`
+	ParentHash    BlockHash      `json:"parent_hash"`
+	BlockIndex    int            `json:"block_index"`
+	TokenCount    int            `json:"token_count"`
+	SizeBytes     int64          `json:"size_bytes"`
+	ObservedAt    time.Time      `json:"observed_at"`
+	LeaseDuration time.Duration  `json:"lease_duration"`
 }
 
 type CacheEntry struct {
@@ -94,11 +94,22 @@ type EventResult struct {
 }
 
 type CacheStats struct {
-	Entries        int
-	Workers        int
-	PrefixKeys     int
-	SeenEventIDs   int
-	ExpiredEntries uint64
+	Entries          int
+	Workers          int
+	PrefixKeys       int
+	SeenEventIDs     int
+	ExpiredEntries   uint64
+	AppliedEvents    uint64
+	DuplicateEvents  uint64
+	OutOfOrderEvents uint64
+	SequenceGaps     uint64
+	RejectedEvents   uint64
+	Resets           uint64
+}
+
+type WorkerCacheSnapshot struct {
+	Worker  WorkerInstanceKey `json:"worker"`
+	Summary CacheSummary      `json:"summary"`
 }
 
 type cacheWorkerView struct {
@@ -124,11 +135,13 @@ type CacheIndex struct {
 	instances  map[string]string
 	seenEvents eventDeduper
 
-	maxEntries         int
-	staleViewThreshold time.Duration
-	entryCount         int
-	expiredEntries     uint64
-	now                func() time.Time
+	maxEntries                                                                     int
+	staleViewThreshold                                                             time.Duration
+	entryCount                                                                     int
+	expiredEntries                                                                 uint64
+	appliedEvents, duplicateEvents, outOfOrderEvents, sequenceGaps, rejectedEvents uint64
+	resets                                                                         uint64
+	now                                                                            func() time.Time
 }
 
 func NewCacheIndex(maxEntries, eventDedupCapacity int, staleViewThreshold time.Duration) (*CacheIndex, error) {
@@ -187,12 +200,16 @@ func (index *CacheIndex) SetWorkerCapacity(workerID, instanceID string, capacity
 func (index *CacheIndex) Apply(event CacheEvent) (EventResult, error) {
 	prepared, cacheKey, err := prepareEvent(event, index.now())
 	if err != nil {
+		index.mu.Lock()
+		index.rejectedEvents++
+		index.mu.Unlock()
 		return EventResult{}, err
 	}
 	workerKey := WorkerInstanceKey{WorkerID: event.WorkerID, InstanceID: event.InstanceID}
 	index.mu.Lock()
 	defer index.mu.Unlock()
 	if index.instances[event.WorkerID] != event.InstanceID {
+		index.rejectedEvents++
 		return EventResult{}, ErrStaleWorkerInstance
 	}
 	view := index.views[workerKey]
@@ -202,20 +219,24 @@ func (index *CacheIndex) Apply(event CacheEvent) (EventResult, error) {
 	}
 	result := EventResult{PreviousState: view.state, CurrentState: view.state}
 	if index.seenEvents.contains(event.EventID) {
+		index.duplicateEvents++
 		result.Duplicate = true
 		return result, nil
 	}
 	if event.Sequence <= view.lastSequence {
+		index.outOfOrderEvents++
 		index.seenEvents.add(event.EventID)
 		result.OutOfOrder = true
 		return result, nil
 	}
 	if event.Sequence > view.lastSequence+1 {
 		result.SequenceGap = true
+		index.sequenceGaps++
 	}
 	if event.Type == CacheEventReset {
 		index.removeEntriesLocked(workerKey)
 		view.state = CacheViewReady
+		index.resets++
 	} else {
 		switch event.Type {
 		case CacheEventAdd:
@@ -243,6 +264,7 @@ func (index *CacheIndex) Apply(event CacheEvent) (EventResult, error) {
 	view.lastSequence = event.Sequence
 	view.lastUpdated = prepared.LastAccess
 	result.Applied = true
+	index.appliedEvents++
 	result.CurrentState = view.state
 	return result, nil
 }
@@ -437,7 +459,64 @@ func (index *CacheIndex) RunCleanup(ctx context.Context, interval time.Duration,
 func (index *CacheIndex) Stats() CacheStats {
 	index.mu.RLock()
 	defer index.mu.RUnlock()
-	return CacheStats{Entries: index.entryCount, Workers: len(index.byWorker), PrefixKeys: len(index.byPrefix), SeenEventIDs: index.seenEvents.count, ExpiredEntries: index.expiredEntries}
+	return CacheStats{Entries: index.entryCount, Workers: len(index.byWorker), PrefixKeys: len(index.byPrefix), SeenEventIDs: index.seenEvents.count, ExpiredEntries: index.expiredEntries, AppliedEvents: index.appliedEvents, DuplicateEvents: index.duplicateEvents, OutOfOrderEvents: index.outOfOrderEvents, SequenceGaps: index.sequenceGaps, RejectedEvents: index.rejectedEvents, Resets: index.resets}
+}
+
+func (index *CacheIndex) WorkerSummaries(limit int, now time.Time) []WorkerCacheSnapshot {
+	if limit < 1 {
+		return nil
+	}
+	index.mu.RLock()
+	keys := make([]WorkerInstanceKey, 0, len(index.views))
+	for key := range index.views {
+		keys = append(keys, key)
+	}
+	index.mu.RUnlock()
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].WorkerID == keys[j].WorkerID {
+			return keys[i].InstanceID < keys[j].InstanceID
+		}
+		return keys[i].WorkerID < keys[j].WorkerID
+	})
+	if len(keys) > limit {
+		keys = keys[:limit]
+	}
+	result := make([]WorkerCacheSnapshot, 0, len(keys))
+	for _, key := range keys {
+		if summary, ok := index.Summary(key, now); ok {
+			result = append(result, WorkerCacheSnapshot{Worker: key, Summary: summary})
+		}
+	}
+	return result
+}
+
+func (index *CacheIndex) FindPrefixHash(prefix BlockHash, limit int, now time.Time) []CacheEntry {
+	if limit < 1 {
+		return nil
+	}
+	index.mu.RLock()
+	result := make([]CacheEntry, 0)
+	for key, workers := range index.byPrefix {
+		if key.PrefixHash != prefix {
+			continue
+		}
+		for _, entry := range workers {
+			if entry.LeaseExpires.After(now) {
+				result = append(result, *entry)
+			}
+		}
+	}
+	index.mu.RUnlock()
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Worker.WorkerID == result[j].Worker.WorkerID {
+			return result[i].Worker.InstanceID < result[j].Worker.InstanceID
+		}
+		return result[i].Worker.WorkerID < result[j].Worker.WorkerID
+	})
+	if len(result) > limit {
+		result = result[:limit]
+	}
+	return result
 }
 
 func (index *CacheIndex) ValidateInvariants() error {

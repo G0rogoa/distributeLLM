@@ -65,3 +65,9 @@ under a read lock, then sort and truncate after unlocking. Lock rules are:
 3. Apply Worker instance changes and Cache events through explicit sequential methods.
 4. The cleanup goroutine is created by its owner, stops its ticker on return, and exits
    when its context is cancelled; each cleanup pass removes only a bounded batch.
+
+The Mock Cache mutex covers its map, LRU list, counters, and event sequence. Events are
+published only after unlocking through a bounded non-blocking channel. Loss is counted;
+a later sequence gap degrades the Controller view. Fill reservations use a separate
+mutex and idempotent release closure. Their cleanup goroutine exits on the Controller
+context. Registry, CacheIndex, MockCache, and fill locks are never held together.

@@ -201,3 +201,13 @@ func (r *Registry) Reserve(id, instanceID string) (func(), error) {
 }
 
 func (r *Registry) SetNowForTest(now func() time.Time) { r.now = now }
+
+func (r *Registry) CurrentInstance(id string) (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	worker := r.workers[id]
+	if worker == nil {
+		return "", false
+	}
+	return worker.InstanceID, true
+}

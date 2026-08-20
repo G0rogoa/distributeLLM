@@ -23,3 +23,10 @@ without blocking requests. A Reset clears one instance. Worker restart removes t
 instance view, and late old events are rejected. Expired leases are excluded from lookup
 before asynchronous cleanup. Controller restart loses the advisory index and therefore
 starts cold rather than claiming false cache hits.
+## Phase 2 cache failures
+
+Cache metadata is only a performance hint. Event loss, reordering, lease expiry,
+eviction, or Worker restart may cause a prediction miss; the Worker performs a local
+lookup and safely falls back to full prefill. Instance IDs reject events from replaced
+processes. Sequence gaps degrade a view and expired views are not matched. Bounded
+queues and indexes prefer observable rejection over unbounded memory growth.

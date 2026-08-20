@@ -6,22 +6,30 @@ import (
 )
 
 type Request struct {
-	RequestID         string    `json:"request_id"`
-	ReceivedAt        time.Time `json:"received_at"`
-	AdmittedAt        time.Time `json:"admitted_at,omitempty"`
-	ScheduledAt       time.Time `json:"scheduled_at,omitempty"`
-	ForwardedAt       time.Time `json:"forwarded_at,omitempty"`
-	FirstTokenAt      time.Time `json:"first_token_at,omitempty"`
-	CompletedAt       time.Time `json:"completed_at,omitempty"`
-	FailedAt          time.Time `json:"failed_at,omitempty"`
-	SelectedWorker    string    `json:"selected_worker,omitempty"`
-	SelectedInstance  string    `json:"selected_instance,omitempty"`
-	SchedulerStrategy string    `json:"scheduler_strategy,omitempty"`
-	RetryCount        int       `json:"retry_count"`
-	InputTokens       int       `json:"input_tokens"`
-	OutputTokens      int       `json:"output_tokens"`
-	ResponseStarted   bool      `json:"response_started"`
-	FinalStatus       string    `json:"final_status"`
+	RequestID            string    `json:"request_id"`
+	ReceivedAt           time.Time `json:"received_at"`
+	AdmittedAt           time.Time `json:"admitted_at,omitempty"`
+	ScheduledAt          time.Time `json:"scheduled_at,omitempty"`
+	ForwardedAt          time.Time `json:"forwarded_at,omitempty"`
+	FirstTokenAt         time.Time `json:"first_token_at,omitempty"`
+	CompletedAt          time.Time `json:"completed_at,omitempty"`
+	FailedAt             time.Time `json:"failed_at,omitempty"`
+	SelectedWorker       string    `json:"selected_worker,omitempty"`
+	SelectedInstance     string    `json:"selected_instance,omitempty"`
+	SchedulerStrategy    string    `json:"scheduler_strategy,omitempty"`
+	RetryCount           int       `json:"retry_count"`
+	InputTokens          int       `json:"input_tokens"`
+	OutputTokens         int       `json:"output_tokens"`
+	ResponseStarted      bool      `json:"response_started"`
+	FinalStatus          string    `json:"final_status"`
+	CacheFullBlocks      int       `json:"cache_full_blocks"`
+	CachePredictedBlocks int       `json:"cache_predicted_blocks"`
+	CachePredictedTokens int       `json:"cache_predicted_tokens"`
+	CacheActualBlocks    int       `json:"cache_actual_blocks"`
+	CacheActualTokens    int       `json:"cache_actual_tokens"`
+	CacheViewState       string    `json:"cache_view_state,omitempty"`
+	CacheFillReserved    bool      `json:"cache_fill_reserved"`
+	CachePredictionMiss  bool      `json:"cache_prediction_miss"`
 }
 
 type Store struct {
@@ -61,4 +69,13 @@ func (s *Store) Snapshot() []Request {
 	}
 	result = append(result, s.items[:s.next]...)
 	return result
+}
+
+func (s *Store) Find(requestID string) (Request, bool) {
+	for _, request := range s.Snapshot() {
+		if request.RequestID == requestID {
+			return request, true
+		}
+	}
+	return Request{}, false
 }

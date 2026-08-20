@@ -11,22 +11,32 @@ import (
 	"time"
 
 	"distserve/internal/api"
+	"distserve/internal/backend"
+	"distserve/internal/cache"
 )
 
 type Worker struct {
-	Model              string
-	PrefillDelay       time.Duration
-	DecodeInterval     time.Duration
-	PrefillPerToken    time.Duration
-	ConcurrencyPenalty time.Duration
-	Jitter             time.Duration
-	FailureRate        float64
-	capacity           chan struct{}
-	queueSlots         chan struct{}
-	active             atomic.Int64
-	queued             atomic.Int64
-	randomMu           sync.Mutex
-	random             *rand.Rand
+	Model                string
+	PrefillDelay         time.Duration
+	DecodeInterval       time.Duration
+	PrefillPerToken      time.Duration
+	ConcurrencyPenalty   time.Duration
+	Jitter               time.Duration
+	FailureRate          float64
+	capacity             chan struct{}
+	queueSlots           chan struct{}
+	active               atomic.Int64
+	queued               atomic.Int64
+	randomMu             sync.Mutex
+	random               *rand.Rand
+	mockCache            *cache.MockCache
+	cacheBytesPerToken   int64
+	cacheLease           time.Duration
+	cacheLookupDelay     time.Duration
+	cacheEvents          chan<- cache.CacheEvent
+	droppedCacheEvents   atomic.Int64
+	prefillTokens        atomic.Int64
+	prefillTokensSkipped atomic.Int64
 }
 
 type Config struct {
@@ -62,15 +72,53 @@ func NewWithConfig(config Config) *Worker {
 func (w *Worker) Active() int64 { return w.active.Load() }
 func (w *Worker) Queued() int64 { return w.queued.Load() }
 
+func (w *Worker) EnableCache(worker cache.WorkerInstanceKey, capacityBytes, bytesPerToken int64, lease, lookupDelay time.Duration, events chan<- cache.CacheEvent) error {
+	if bytesPerToken <= 0 || lease <= 0 {
+		return cache.ErrInvalidCacheEvent
+	}
+	mock, err := cache.NewMockCache(worker, capacityBytes)
+	if err != nil {
+		return err
+	}
+	w.mockCache = mock
+	w.cacheBytesPerToken = bytesPerToken
+	w.cacheLease = lease
+	w.cacheLookupDelay = lookupDelay
+	w.cacheEvents = events
+	return nil
+}
+
+func (w *Worker) CacheStats() (cache.MockCacheStats, bool) {
+	if w.mockCache == nil {
+		return cache.MockCacheStats{}, false
+	}
+	return w.mockCache.Stats(), true
+}
+func (w *Worker) DroppedCacheEvents() int64 { return w.droppedCacheEvents.Load() }
+
 func (w *Worker) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(out http.ResponseWriter, _ *http.Request) { out.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("POST /v1/chat/completions", w.chatCompletions)
+	mux.HandleFunc("GET /metrics", w.metrics)
 	return mux
 }
 
+func (w *Worker) metrics(out http.ResponseWriter, _ *http.Request) {
+	out.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	stats, _ := w.CacheStats()
+	fmt.Fprintf(out, "distserve_mock_cache_hits_total %d\n", stats.Hits)
+	fmt.Fprintf(out, "distserve_mock_cache_misses_total %d\n", stats.Misses)
+	fmt.Fprintf(out, "distserve_mock_cache_evictions_total %d\n", stats.Evictions)
+	fmt.Fprintf(out, "distserve_mock_cache_used_bytes %d\n", stats.UsedBytes)
+	fmt.Fprintf(out, "distserve_mock_cache_capacity_bytes %d\n", stats.CapacityBytes)
+	fmt.Fprintf(out, "distserve_mock_cache_events_dropped_total %d\n", w.DroppedCacheEvents())
+	fmt.Fprintf(out, "distserve_mock_prefill_tokens_total %d\n", w.prefillTokens.Load())
+	fmt.Fprintf(out, "distserve_mock_prefill_tokens_skipped_total %d\n", w.prefillTokensSkipped.Load())
+}
+
 func (w *Worker) chatCompletions(out http.ResponseWriter, r *http.Request) {
-	var input api.ChatCompletionRequest
+	var input backend.ChatCompletionRequest
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil || input.Model != w.Model || input.MaxTokens < 1 {
 		http.Error(out, "invalid request", http.StatusBadRequest)
 		return
@@ -105,12 +153,35 @@ func (w *Worker) chatCompletions(out http.ResponseWriter, r *http.Request) {
 	for _, message := range input.Messages {
 		inputTokens += (len(message.Content) + 3) / 4
 	}
-	prefill := w.PrefillDelay + time.Duration(inputTokens)*w.PrefillPerToken + w.jitter()
+	if input.CacheHint != nil {
+		inputTokens = input.CacheHint.TotalInputTokens
+	}
+	actualMatchedBlocks, actualMatchedTokens := 0, 0
+	if w.mockCache != nil && input.CacheHint != nil {
+		var events []cache.CacheEvent
+		// The Controller hint is a prediction. The Worker checks every requested
+		// block because its local cache is the final authority.
+		actualMatchedBlocks, actualMatchedTokens, events, _ = w.mockCache.Lookup(input.CacheHint.Identity, input.CacheHint.PrefixBlocks, time.Now(), w.cacheLease)
+		w.publishCacheEvents(events)
+	}
+	out.Header().Set("X-DistServe-Actual-Hit-Blocks", fmt.Sprint(actualMatchedBlocks))
+	out.Header().Set("X-DistServe-Actual-Hit-Tokens", fmt.Sprint(actualMatchedTokens))
+	uncachedTokens := inputTokens - actualMatchedTokens
+	if uncachedTokens < 0 {
+		uncachedTokens = 0
+	}
+	w.prefillTokens.Add(int64(uncachedTokens))
+	w.prefillTokensSkipped.Add(int64(actualMatchedTokens))
+	prefill := w.PrefillDelay + time.Duration(uncachedTokens)*w.PrefillPerToken + w.cacheLookupDelay + w.jitter()
 	if !wait(r, prefill) {
 		return
 	}
+	if w.mockCache != nil && input.CacheHint != nil {
+		events, _ := w.mockCache.Fill(input.CacheHint.Identity, input.CacheHint.PrefixBlocks, w.cacheBytesPerToken, time.Now(), w.cacheLease)
+		w.publishCacheEvents(events)
+	}
 	if input.Stream {
-		w.stream(out, r, input)
+		w.stream(out, r, input.ChatCompletionRequest)
 		return
 	}
 	if !wait(r, time.Duration(input.MaxTokens)*w.decodeDelay()) {
@@ -120,6 +191,16 @@ func (w *Worker) chatCompletions(out http.ResponseWriter, r *http.Request) {
 	response := api.ChatCompletionResponse{ID: r.Header.Get("X-Request-ID"), Object: "chat.completion", Model: w.Model, Choices: []api.Choice{{Index: 0, Message: &api.Message{Role: "assistant", Content: tokenText(input.MaxTokens)}, FinishReason: &finish}}}
 	out.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(out).Encode(response)
+}
+
+func (w *Worker) publishCacheEvents(events []cache.CacheEvent) {
+	for _, event := range events {
+		select {
+		case w.cacheEvents <- event:
+		default:
+			w.droppedCacheEvents.Add(1)
+		}
+	}
 }
 
 func (w *Worker) stream(out http.ResponseWriter, r *http.Request, input api.ChatCompletionRequest) {

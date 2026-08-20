@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"distserve/internal/api"
+	"distserve/internal/cache"
 )
 
 type RegistrationConfig struct {
@@ -20,6 +21,7 @@ type RegistrationConfig struct {
 	Model         string
 	Capacity      int
 	Interval      time.Duration
+	CacheEvents   <-chan cache.CacheEvent
 }
 
 func (w *Worker) RunRegistration(ctx context.Context, config RegistrationConfig, client *http.Client) error {
@@ -35,16 +37,31 @@ func (w *Worker) RunRegistration(ctx context.Context, config RegistrationConfig,
 			if err := postJSON(ctx, client, strings.TrimRight(config.ControllerURL, "/")+"/internal/workers/register", register); err == nil {
 				registered = true
 			}
-		} else {
-			heartbeat := api.HeartbeatRequest{InstanceID: config.InstanceID, ReportedRunning: int(w.Active()), ReportedQueued: int(w.Queued())}
-			if err := postJSON(ctx, client, strings.TrimRight(config.ControllerURL, "/")+"/internal/workers/"+config.ID+"/heartbeat", heartbeat); err != nil {
-				registered = false
+			if !registered {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-ticker.C:
+					continue
+				}
 			}
 		}
 		select {
 		case <-ctx.Done():
 			return nil
+		case event, ok := <-config.CacheEvents:
+			if !ok {
+				config.CacheEvents = nil
+				continue
+			}
+			if err := postJSON(ctx, client, strings.TrimRight(config.ControllerURL, "/")+"/internal/workers/"+config.ID+"/cache/events", event); err != nil {
+				registered = false
+			}
 		case <-ticker.C:
+			heartbeat := api.HeartbeatRequest{InstanceID: config.InstanceID, ReportedRunning: int(w.Active()), ReportedQueued: int(w.Queued())}
+			if err := postJSON(ctx, client, strings.TrimRight(config.ControllerURL, "/")+"/internal/workers/"+config.ID+"/heartbeat", heartbeat); err != nil {
+				registered = false
+			}
 		}
 	}
 }

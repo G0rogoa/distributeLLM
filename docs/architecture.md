@@ -77,4 +77,15 @@ infrastructure and does not claim compatibility with a real model.
 The in-memory Cache Index maintains bidirectional Worker-to-prefix and prefix-to-Worker
 maps. Cache events are versioned by Worker instance and ordered by per-instance sequence;
 leases and bounded cleanup prevent metadata from remaining schedulable forever. The
-index is advisory and is not yet connected to Mock Worker execution in Milestone 2.2.
+index is advisory. The completed Phase 2 path is:
+
+```text
+Gateway prepare -> CacheIndex.Match -> PrefixAware.Select -> Registry.Reserve
+  -> FillReservations.Reserve -> Worker local lookup -> uncached prefill
+  -> local LRU fill -> bounded event channel -> CacheIndex.Apply
+```
+
+The cache hint is internal transport data, not part of the public OpenAI DTO. The
+Worker checks its complete local chain and reports actual hits; stale Controller
+metadata can change latency but cannot change generated output. Fill reservations are
+TTL-bound affinity hints and are released on all request exit paths.

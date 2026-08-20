@@ -8,12 +8,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"distserve/internal/cache"
 	"distserve/internal/registry"
 )
 
 type Metrics struct {
 	Requests, Inflight, GeneratedTokens, Errors, Retries                     atomic.Int64
 	AdmissionRejections, SchedulerDecisions, SchedulerFailures, Reservations atomic.Int64
+	CachePredictedTokens, CacheActualTokens, CachePredictionMisses           atomic.Int64
 	mu                                                                       sync.Mutex
 	requestDurationSum, ttftSum                                              float64
 	requestDurationCount, ttftCount                                          int64
@@ -42,7 +44,7 @@ func (m *Metrics) ObserveTTFT(seconds float64) {
 	m.mu.Unlock()
 }
 
-func (m *Metrics) Handler(snapshots func() []registry.WorkerSnapshot) http.HandlerFunc {
+func (m *Metrics) Handler(snapshots func() []registry.WorkerSnapshot, cacheStats func() cache.CacheStats) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		m.mu.Lock()
@@ -61,7 +63,10 @@ func (m *Metrics) Handler(snapshots func() []registry.WorkerSnapshot) http.Handl
 			"distserve_request_retries_total": float64(m.Retries.Load()), "distserve_admission_rejections_total": float64(m.AdmissionRejections.Load()),
 			"distserve_scheduler_decisions_total": float64(m.SchedulerDecisions.Load()), "distserve_scheduler_failures_total": float64(m.SchedulerFailures.Load()),
 			"distserve_scheduler_decision_duration_seconds_sum": 0, "distserve_scheduler_decision_duration_seconds_count": float64(m.SchedulerDecisions.Load()),
-			"distserve_worker_reservations": float64(m.Reservations.Load()),
+			"distserve_worker_reservations":              float64(m.Reservations.Load()),
+			"distserve_cache_predicted_hit_tokens_total": float64(m.CachePredictedTokens.Load()),
+			"distserve_cache_actual_hit_tokens_total":    float64(m.CacheActualTokens.Load()),
+			"distserve_cache_prediction_misses_total":    float64(m.CachePredictionMisses.Load()),
 		}
 		names := make([]string, 0, len(values))
 		for name := range values {
@@ -73,6 +78,17 @@ func (m *Metrics) Handler(snapshots func() []registry.WorkerSnapshot) http.Handl
 		}
 		for id, count := range selected {
 			fmt.Fprintf(w, "distserve_worker_selected_total{worker_id=%q} %d\n", id, count)
+		}
+		if cacheStats != nil {
+			stats := cacheStats()
+			fmt.Fprintf(w, "distserve_cache_entries %d\n", stats.Entries)
+			fmt.Fprintf(w, "distserve_cache_events_total %d\n", stats.AppliedEvents)
+			fmt.Fprintf(w, "distserve_cache_event_errors_total %d\n", stats.RejectedEvents)
+			fmt.Fprintf(w, "distserve_cache_event_duplicates_total %d\n", stats.DuplicateEvents)
+			fmt.Fprintf(w, "distserve_cache_event_out_of_order_total %d\n", stats.OutOfOrderEvents)
+			fmt.Fprintf(w, "distserve_cache_event_sequence_gaps_total %d\n", stats.SequenceGaps)
+			fmt.Fprintf(w, "distserve_cache_entries_expired_total %d\n", stats.ExpiredEntries)
+			fmt.Fprintf(w, "distserve_cache_resets_total %d\n", stats.Resets)
 		}
 		states := map[registry.WorkerStatus]int{}
 		if snapshots != nil {
