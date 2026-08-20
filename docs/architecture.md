@@ -59,3 +59,17 @@ boundaries without changing the external API.
 Dependency direction is `cmd -> gateway -> registry/scheduler`, while `scheduler` only
 depends on Registry snapshot types. Selection is followed by a separate atomic Reserve
 commit so a stale snapshot cannot create work on a changed or full instance.
+
+## Phase 2 prefix preparation
+
+`internal/cache` now provides a request-local preparation pipeline without changing
+Phase 1 scheduling behavior:
+
+```text
+messages -> deterministic PromptBuilder -> Tokenizer -> TokenBlock builder
+         -> versioned CacheIdentity -> SHA-256 Prefix Hash Chain
+```
+
+Tokenization and hashing run before any future Cache Index lock is acquired. Only full
+blocks enter the reusable prefix chain. The mock Tokenizer is deterministic test
+infrastructure and does not claim compatibility with a real model.

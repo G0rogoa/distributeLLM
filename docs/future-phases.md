@@ -1,9 +1,11 @@
 # Future phases
 
-Phase 2 adds prompt token blocks, block hashes, a bounded prefix trie/radix tree,
-per-worker cache summaries, invalidation, overlap scoring, and a cache-aware Scheduler.
-`RequestMeta` and immutable `WorkerSnapshot` are the extension points; Gateway does not
-need direct Registry map access.
+Phase 2 has begun with deterministic prompt building, mock tokenization, fixed token
+blocks, cache identity, and a versioned prefix hash chain. The remaining Phase 2 work
+adds a bounded in-memory Cache Index, per-worker cache summaries, invalidation, overlap
+scoring, mock LRU caches, and a cache-aware Scheduler. `RequestMeta` and immutable
+`WorkerSnapshot` remain the extension points; Gateway does not need direct Registry map
+access.
 
 Phase 3 adds thin vLLM/SGLang HTTP adapters and Worker roles (`aggregated`, `prefill`,
 `decode`). Real prefill/decode separation requires explicit KV transfer and failure

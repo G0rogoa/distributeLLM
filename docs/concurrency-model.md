@@ -48,3 +48,9 @@ protected by its own mutex because `math/rand.Rand` is not concurrency-safe.
 Telemetry counters are atomic; floating-point observation sums and the lifecycle ring
 buffer use separate mutexes. No network I/O or logging occurs while Registry locks are
 held.
+
+Phase 2 prompt building, mock tokenization, block construction, and prefix hashing are
+pure request-local operations. They own their returned slices and acquire no shared
+locks. Context cancellation is checked before and during tokenization/prompt building.
+Future Cache Index code must not hold Registry or Cache Index locks while running these
+potentially linear-time operations.
