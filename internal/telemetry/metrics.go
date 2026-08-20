@@ -1,0 +1,94 @@
+package telemetry
+
+import (
+	"fmt"
+	"net/http"
+	"sort"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"distserve/internal/registry"
+)
+
+type Metrics struct {
+	Requests, Inflight, GeneratedTokens, Errors, Retries                     atomic.Int64
+	AdmissionRejections, SchedulerDecisions, SchedulerFailures, Reservations atomic.Int64
+	mu                                                                       sync.Mutex
+	requestDurationSum, ttftSum                                              float64
+	requestDurationCount, ttftCount                                          int64
+	selected                                                                 map[string]int64
+}
+
+func (m *Metrics) RecordSelection(workerID string) {
+	m.mu.Lock()
+	if m.selected == nil {
+		m.selected = map[string]int64{}
+	}
+	m.selected[workerID]++
+	m.mu.Unlock()
+}
+
+func (m *Metrics) ObserveRequest(seconds float64) {
+	m.mu.Lock()
+	m.requestDurationSum += seconds
+	m.requestDurationCount++
+	m.mu.Unlock()
+}
+func (m *Metrics) ObserveTTFT(seconds float64) {
+	m.mu.Lock()
+	m.ttftSum += seconds
+	m.ttftCount++
+	m.mu.Unlock()
+}
+
+func (m *Metrics) Handler(snapshots func() []registry.WorkerSnapshot) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		m.mu.Lock()
+		durationSum, durationCount, ttftSum, ttftCount := m.requestDurationSum, m.requestDurationCount, m.ttftSum, m.ttftCount
+		selected := make(map[string]int64, len(m.selected))
+		for id, count := range m.selected {
+			selected[id] = count
+		}
+		m.mu.Unlock()
+		values := map[string]float64{
+			"distserve_requests_total": float64(m.Requests.Load()), "distserve_requests_inflight": float64(m.Inflight.Load()),
+			"distserve_request_duration_seconds_sum": durationSum, "distserve_request_duration_seconds_count": float64(durationCount),
+			"distserve_time_to_first_token_seconds_sum": ttftSum, "distserve_time_to_first_token_seconds_count": float64(ttftCount),
+			"distserve_time_per_output_token_seconds_sum": 0, "distserve_time_per_output_token_seconds_count": 0,
+			"distserve_generated_tokens_total": float64(m.GeneratedTokens.Load()), "distserve_request_errors_total": float64(m.Errors.Load()),
+			"distserve_request_retries_total": float64(m.Retries.Load()), "distserve_admission_rejections_total": float64(m.AdmissionRejections.Load()),
+			"distserve_scheduler_decisions_total": float64(m.SchedulerDecisions.Load()), "distserve_scheduler_failures_total": float64(m.SchedulerFailures.Load()),
+			"distserve_scheduler_decision_duration_seconds_sum": 0, "distserve_scheduler_decision_duration_seconds_count": float64(m.SchedulerDecisions.Load()),
+			"distserve_worker_reservations": float64(m.Reservations.Load()),
+		}
+		names := make([]string, 0, len(values))
+		for name := range values {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			fmt.Fprintf(w, "# TYPE %s gauge\n%s %g\n", name, name, values[name])
+		}
+		for id, count := range selected {
+			fmt.Fprintf(w, "distserve_worker_selected_total{worker_id=%q} %d\n", id, count)
+		}
+		states := map[registry.WorkerStatus]int{}
+		if snapshots != nil {
+			for _, worker := range snapshots() {
+				states[worker.Status]++
+				age := time.Since(worker.LastHeartbeat).Seconds()
+				if age < 0 {
+					age = 0
+				}
+				fmt.Fprintf(w, "distserve_worker_heartbeat_age_seconds{worker_id=%q} %g\n", worker.ID, age)
+				fmt.Fprintf(w, "distserve_worker_reported_running{worker_id=%q} %d\n", worker.ID, worker.ReportedRunning)
+				fmt.Fprintf(w, "distserve_worker_reported_queued{worker_id=%q} %d\n", worker.ID, worker.ReportedQueued)
+			}
+		}
+		for _, state := range []registry.WorkerStatus{registry.StatusStarting, registry.StatusHealthy, registry.StatusSuspect, registry.StatusDraining, registry.StatusUnavailable} {
+			fmt.Fprintf(w, "distserve_workers_by_state{state=%q} %d\n", state, states[state])
+		}
+	}
+}

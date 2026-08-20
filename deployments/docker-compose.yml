@@ -1,0 +1,32 @@
+services:
+  controller:
+    build:
+      context: ..
+    command: ["/usr/local/bin/controller", "-listen=:8080", "-scheduler=least-loaded", "-retry"]
+    ports: ["8080:8080"]
+
+  worker-1:
+    build: {context: ..}
+    command: ["/usr/local/bin/mockworker", "-listen=:9001", "-controller=http://controller:8080", "-id=worker-1", "-advertise=http://worker-1:9001"]
+    depends_on: [controller]
+  worker-2:
+    build: {context: ..}
+    command: ["/usr/local/bin/mockworker", "-listen=:9001", "-controller=http://controller:8080", "-id=worker-2", "-advertise=http://worker-2:9001", "-decode-interval=20ms"]
+    depends_on: [controller]
+  worker-3:
+    build: {context: ..}
+    command: ["/usr/local/bin/mockworker", "-listen=:9001", "-controller=http://controller:8080", "-id=worker-3", "-advertise=http://worker-3:9001", "-decode-interval=25ms"]
+    depends_on: [controller]
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes: ["./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+    depends_on: [controller]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    volumes:
+      - "./grafana/provisioning:/etc/grafana/provisioning:ro"
+    ports: ["3000:3000"]
+    depends_on: [prometheus]

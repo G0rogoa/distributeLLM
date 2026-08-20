@@ -1,0 +1,10 @@
+.agents/
+.codex/
+.git-distserve/
+
+# Local binaries and benchmark output.
+/controller
+/mockworker
+/loadgen
+/results/
+*.out

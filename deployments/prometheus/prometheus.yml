@@ -1,0 +1,6 @@
+global:
+  scrape_interval: 2s
+scrape_configs:
+  - job_name: distserve
+    static_configs:
+      - targets: ["controller:8080"]
