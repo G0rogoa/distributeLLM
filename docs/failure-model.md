@@ -16,3 +16,10 @@
 
 Phase 1 does not solve network partitions, durable state, authentication, exactly-once
 execution, distributed consensus, or recovery of in-memory lifecycle history.
+
+Phase 2 Cache Events are idempotent by bounded EventID memory and ordered by a monotonic
+per-instance Sequence. Old events are ignored; a sequence gap degrades the cache view
+without blocking requests. A Reset clears one instance. Worker restart removes the old
+instance view, and late old events are rejected. Expired leases are excluded from lookup
+before asynchronous cleanup. Controller restart loses the advisory index and therefore
+starts cold rather than claiming false cache hits.

@@ -54,3 +54,14 @@ pure request-local operations. They own their returned slices and acquire no sha
 locks. Context cancellation is checked before and during tokenization/prompt building.
 Future Cache Index code must not hold Registry or Cache Index locks while running these
 potentially linear-time operations.
+
+The Cache Index has one `sync.RWMutex` protecting both directions of its index, Worker
+instance/view state, sequence numbers, entry count, and bounded EventID deduper. Both
+directions are updated within one write-lock critical section. Queries copy entries
+under a read lock, then sort and truncate after unlocking. Lock rules are:
+
+1. Never hold Registry and Cache Index locks at the same time.
+2. Never tokenize, hash, log, or perform HTTP while holding the Cache Index lock.
+3. Apply Worker instance changes and Cache events through explicit sequential methods.
+4. The cleanup goroutine is created by its owner, stops its ticker on return, and exits
+   when its context is cancelled; each cleanup pass removes only a bounded batch.

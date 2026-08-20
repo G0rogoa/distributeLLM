@@ -73,3 +73,8 @@ messages -> deterministic PromptBuilder -> Tokenizer -> TokenBlock builder
 Tokenization and hashing run before any future Cache Index lock is acquired. Only full
 blocks enter the reusable prefix chain. The mock Tokenizer is deterministic test
 infrastructure and does not claim compatibility with a real model.
+
+The in-memory Cache Index maintains bidirectional Worker-to-prefix and prefix-to-Worker
+maps. Cache events are versioned by Worker instance and ordered by per-instance sequence;
+leases and bounded cleanup prevent metadata from remaining schedulable forever. The
+index is advisory and is not yet connected to Mock Worker execution in Milestone 2.2.
