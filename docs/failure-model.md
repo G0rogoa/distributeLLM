@@ -23,6 +23,31 @@ without blocking requests. A Reset clears one instance. Worker restart removes t
 instance view, and late old events are rejected. Expired leases are excluded from lookup
 before asynchronous cleanup. Controller restart loses the advisory index and therefore
 starts cold rather than claiming false cache hits.
+
+## Planned Stage 4 resource failures
+
+- Observer error or stale data is fail-closed: no new Worker starts. An error never
+  proves a GPU idle.
+- Lease expiry, refresh failure, corrupt data, version rollback, or conflict blocks
+  entry and moves an owned Worker toward Draining.
+- Start or model-load failure removes the incomplete Registry instance, invalidates
+  its cache view, records the reason, and enters backoff/cooldown.
+- Stop timeout escalates only against the exact DistServe-owned process. Failure to
+  verify exit or memory release keeps the GPU unavailable and raises an audit event;
+  no foreign process is signalled.
+- Node Agent restart reconstructs observations and configured Leases but does not
+  claim ownership from device activity. Controller restart starts the advisory cache
+  cold and reconciles Worker instance IDs.
+- Duplicate or reordered decisions are rejected by resource/instance version;
+  lifecycle operations remain idempotent.
+- During reclaim, client cancellation releases request and cache-fill reservations.
+  Draining prevents new selection before cancellation begins.
+- A foreign compute process, GPU pressure, host memory/swap pressure, or sustained I/O
+  pressure stops starts, tightens admission, and triggers prioritized reclaim.
+
+Safe failure favors capacity loss over unauthorized use. Resource automation does not
+kill, pause, reprioritize, or inspect the content of other users' processes.
+
 ## Phase 2 cache failures
 
 Cache metadata is only a performance hint. Event loss, reordering, lease expiry,

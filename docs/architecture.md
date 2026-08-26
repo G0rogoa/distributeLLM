@@ -89,3 +89,41 @@ The cache hint is internal transport data, not part of the public OpenAI DTO. Th
 Worker checks its complete local chain and reports actual hits; stale Controller
 metadata can change latency but cannot change generated output. Fill reservations are
 TTL-bound affinity hints and are released on all request exit paths.
+
+## Planned single-node resource layer
+
+Stage 4 adds a slower resource-control loop around, rather than inside, the existing
+request path:
+
+```text
+Node Agent: GPU Observer + Lease snapshot + host Interference Guard
+                              |
+                              v
+Resource Policy -> Elasticity Manager -> Worker start / drain / stop
+                              |
+                              v
+                         Registry
+                              |
+                              v
+Gateway -> Request Scheduler -> healthy Worker
+              ^               |
+              +-- Cache Index-+
+```
+
+The Registry connects the two scheduling layers: lifecycle changes determine which
+Worker instances are candidates, while request reservations and demand feed back into
+drain and capacity decisions. Worker removal invalidates that exact instance's Cache
+Index view. The request Scheduler receives copied load, cache, and resource-stability
+features; it never depends on a GPU Observer or executes system commands.
+
+Planned resource states are `Unavailable`, `Observed`, `Borrowable`, `Claimed`,
+`Reclaiming`, and `CoolingDown`. Worker lifecycle refines claimed resources through
+`Starting`, `Healthy`, `Draining`, and `Stopping`. Entry requires both authorization
+and a stable idle window. A foreign compute process, Lease expiry, host pressure, or
+administrative reclaim moves state toward release.
+
+The initial deployment has one Controller and one Node Agent on one shared server.
+Each real Worker will initially own one allowed GPU. Multi-node placement, consensus,
+Slurm, Kubernetes, and cross-node KV transfer are outside the current architecture.
+See `resource-policy.md`, `cooperative-lease.md`, and
+`elastic-worker-lifecycle.md` for the planned contracts.
