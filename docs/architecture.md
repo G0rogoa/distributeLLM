@@ -77,7 +77,7 @@ Gateway prepare -> Scheduler.Select -> Registry.Reserve
 
 轻量 `workeragent` 描述并观察一个已经运行的 vLLM instance。它注册 `backend_type: vllm`、新的进程级 `instance_id`、backend URL、model、声明的 GPU index 和可选 labels。它 health-check vLLM，并只报告归一化后的 optional load fields。Controller 不启动、停止或 signal vLLM。
 
-本阶段一张 GPU 对应一个 vLLM instance。多 GPU 会表现为多个独立注册的 Workers，每个 Worker 有自己的 instance ID 和 loopback port。Stage 3 不做跨 Worker KV transfer、tensor-parallel orchestration、自动 GPU 选择或弹性资源 claim。
+本阶段一张 GPU 对应一个 vLLM instance。多 GPU 会表现为多个独立注册的 Workers，每个 Worker 有自己的 instance ID 和 loopback port。Controller 只消费这些静态注册的 Workers：它可以按 scheduler 选择不同 vLLM instances、返回 selected-worker 响应头、记录调度决策 debug history，但不会自动启动进程或占用 GPU。Stage 3 不做跨 Worker KV transfer、tensor-parallel orchestration、自动 GPU 选择或弹性资源 claim。
 
 Cache evidence 必须显式标注。Mock cache events 产生 `MockExact` metadata。真实请求可以产生短 TTL 的 `ShadowEstimated` affinity，并绑定到 `worker_id + instance_id + cache identity`。未知或过期信息是 `Unknown`。vLLM 聚合 prefix-cache metrics 是观测信号，不证明某个具体 prefix 驻留在某个具体 Worker 上。
 

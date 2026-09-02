@@ -25,6 +25,11 @@ type result struct {
 	Status              int
 	Latency, TTFT, TPOT time.Duration
 	Err                 string
+	RequestID           string
+	SelectedWorker      string
+	SelectedInstance    string
+	BackendType         string
+	JobID               string
 }
 type summary struct {
 	Requests    int         `json:"requests"`
@@ -44,10 +49,29 @@ type summary struct {
 	Errors      int         `json:"errors"`
 	Rejections  int         `json:"rejections"`
 }
-type job struct{ InputTokens, OutputTokens int }
+type job struct {
+	ID           string `json:"id"`
+	Prompt       string `json:"prompt"`
+	InputTokens  int    `json:"input_tokens"`
+	OutputTokens int    `json:"output_tokens"`
+}
+
+type resultRecord struct {
+	JobID              string  `json:"job_id,omitempty"`
+	RequestID          string  `json:"request_id,omitempty"`
+	Status             int     `json:"status"`
+	LatencyMS          float64 `json:"latency_ms"`
+	TTFTMS             float64 `json:"ttft_ms,omitempty"`
+	TPOTMS             float64 `json:"tpot_ms,omitempty"`
+	SelectedWorkerID   string  `json:"selected_worker_id,omitempty"`
+	SelectedInstanceID string  `json:"selected_instance_id,omitempty"`
+	BackendType        string  `json:"backend_type,omitempty"`
+	Error              string  `json:"error,omitempty"`
+}
 
 func main() {
 	target := flag.String("target", "http://127.0.0.1:8080", "controller base URL")
+	model := flag.String("model", "mock-llm", "model name sent in chat completion requests")
 	concurrency := flag.Int("concurrency", 8, "concurrent clients")
 	requests := flag.Int("requests", 100, "request count; ignored when duration is set")
 	duration := flag.Duration("duration", 0, "generation duration")
@@ -62,9 +86,16 @@ func main() {
 	seed := flag.Int64("seed", 1, "random seed")
 	timeout := flag.Duration("timeout", 30*time.Second, "per-request timeout")
 	format := flag.String("format", "json", "json or csv")
+	workload := flag.String("workload", "", "optional JSONL workload with input_tokens/output_tokens or prompt")
+	output := flag.String("output", "", "optional JSONL per-request result output")
 	flag.Parse()
 	if *concurrency < 1 || *rate <= 0 || *inputMin < 1 || *inputMax < *inputMin || *outputMin < 1 || *outputMax < *outputMin {
 		fmt.Fprintln(os.Stderr, "invalid load parameters")
+		os.Exit(2)
+	}
+	workloadJobs, err := readWorkload(*workload)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -78,12 +109,16 @@ func main() {
 		go func() {
 			defer workers.Done()
 			for item := range jobs {
-				results <- run(ctx, client, *target, *stream, *timeout, item)
+				results <- run(ctx, client, *target, *model, *stream, *timeout, item)
 			}
 		}()
 	}
 	started := time.Now()
-	go produce(ctx, jobs, *arrival, *requests, *duration, *rate, *burst, *inputMin, *inputMax, *outputMin, *outputMax, *seed)
+	if len(workloadJobs) > 0 {
+		go produceWorkload(ctx, jobs, workloadJobs)
+	} else {
+		go produce(ctx, jobs, *arrival, *requests, *duration, *rate, *burst, *inputMin, *inputMax, *outputMin, *outputMax, *seed)
+	}
 	go func() { workers.Wait(); close(results) }()
 	all := []result{}
 	for item := range results {
@@ -91,12 +126,69 @@ func main() {
 	}
 	elapsed := time.Since(started)
 	value := summarize(all, elapsed)
+	if *output != "" {
+		if err := writeResultsJSONL(*output, all); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
 	if *format == "csv" {
 		writeCSV(value)
 	} else {
 		encoder := json.NewEncoder(os.Stdout)
 		encoder.SetIndent("", "  ")
 		_ = encoder.Encode(value)
+	}
+}
+
+func readWorkload(path string) ([]job, error) {
+	if path == "" {
+		return nil, nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open workload: %w", err)
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	jobs := []job{}
+	lineNumber := 0
+	for scanner.Scan() {
+		lineNumber++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var item job
+		if err := json.Unmarshal([]byte(line), &item); err != nil {
+			return nil, fmt.Errorf("parse workload line %d: %w", lineNumber, err)
+		}
+		if item.ID == "" {
+			item.ID = fmt.Sprintf("line-%d", lineNumber)
+		}
+		if item.OutputTokens < 1 {
+			return nil, fmt.Errorf("workload line %d: output_tokens must be positive", lineNumber)
+		}
+		if item.Prompt == "" && item.InputTokens < 1 {
+			return nil, fmt.Errorf("workload line %d: prompt or input_tokens is required", lineNumber)
+		}
+		jobs = append(jobs, item)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("read workload: %w", err)
+	}
+	return jobs, nil
+}
+
+func produceWorkload(ctx context.Context, jobs chan<- job, workload []job) {
+	defer close(jobs)
+	for _, item := range workload {
+		select {
+		case jobs <- item:
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
@@ -114,7 +206,7 @@ func produce(ctx context.Context, jobs chan<- job, arrival string, count int, du
 			batch = burst
 		}
 		for i := 0; i < batch && ((duration > 0 && time.Now().Before(deadline)) || (duration <= 0 && sent < count)); i++ {
-			item := job{inputMin + random.Intn(inputMax-inputMin+1), outputMin + random.Intn(outputMax-outputMin+1)}
+			item := job{InputTokens: inputMin + random.Intn(inputMax-inputMin+1), OutputTokens: outputMin + random.Intn(outputMax-outputMin+1)}
 			select {
 			case jobs <- item:
 				sent++
@@ -143,20 +235,27 @@ func produce(ctx context.Context, jobs chan<- job, arrival string, count int, du
 	}
 }
 
-func run(parent context.Context, client *http.Client, target string, stream bool, timeout time.Duration, item job) result {
+func run(parent context.Context, client *http.Client, target, model string, stream bool, timeout time.Duration, item job) result {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	input := api.ChatCompletionRequest{Model: "mock-llm", Messages: []api.Message{{Role: "user", Content: strings.Repeat("word ", item.InputTokens)}}, MaxTokens: item.OutputTokens, Stream: stream}
+	prompt := item.Prompt
+	if prompt == "" {
+		prompt = strings.Repeat("word ", item.InputTokens)
+	}
+	input := api.ChatCompletionRequest{Model: model, Messages: []api.Message{{Role: "user", Content: prompt}}, MaxTokens: item.OutputTokens, Stream: stream}
 	body, _ := json.Marshal(input)
 	request, _ := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(target, "/")+"/v1/chat/completions", bytes.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
+	if item.ID != "" {
+		request.Header.Set("X-Request-ID", "loadgen-"+item.ID)
+	}
 	started := time.Now()
 	response, err := client.Do(request)
 	if err != nil {
-		return result{Err: err.Error(), Latency: time.Since(started)}
+		return result{Err: err.Error(), Latency: time.Since(started), JobID: item.ID}
 	}
 	defer response.Body.Close()
-	value := result{Status: response.StatusCode}
+	value := result{Status: response.StatusCode, JobID: item.ID, RequestID: response.Header.Get("X-Request-ID"), SelectedWorker: response.Header.Get("X-DistServe-Worker-ID"), SelectedInstance: response.Header.Get("X-DistServe-Instance-ID"), BackendType: response.Header.Get("X-DistServe-Backend-Type")}
 	if stream && response.StatusCode == http.StatusOK {
 		reader := bufio.NewReader(response.Body)
 		for {
@@ -182,6 +281,33 @@ func run(parent context.Context, client *http.Client, target string, stream bool
 		value.TPOT = (value.Latency - value.TTFT) / time.Duration(item.OutputTokens-1)
 	}
 	return value
+}
+
+func writeResultsJSONL(path string, results []result) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("create output: %w", err)
+	}
+	defer file.Close()
+	encoder := json.NewEncoder(file)
+	for _, item := range results {
+		record := resultRecord{
+			JobID:              item.JobID,
+			RequestID:          item.RequestID,
+			Status:             item.Status,
+			LatencyMS:          float64(item.Latency) / float64(time.Millisecond),
+			TTFTMS:             float64(item.TTFT) / float64(time.Millisecond),
+			TPOTMS:             float64(item.TPOT) / float64(time.Millisecond),
+			SelectedWorkerID:   item.SelectedWorker,
+			SelectedInstanceID: item.SelectedInstance,
+			BackendType:        item.BackendType,
+			Error:              item.Err,
+		}
+		if err := encoder.Encode(record); err != nil {
+			return fmt.Errorf("write output: %w", err)
+		}
+	}
+	return nil
 }
 
 func summarize(results []result, elapsed time.Duration) summary {

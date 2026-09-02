@@ -100,6 +100,9 @@ func main() {
 	mux.HandleFunc("GET /internal/debug/requests", func(w http.ResponseWriter, _ *http.Request) {
 		gw.DebugRequests(w)
 	})
+	mux.HandleFunc("GET /internal/debug/decisions", func(w http.ResponseWriter, _ *http.Request) {
+		gw.DebugDecisions(w)
+	})
 	mux.Handle("/internal/", workerRegistry.Handler())
 	mux.Handle("GET /internal/cache/requests/{id}", gatewayRoutes)
 	mux.Handle("/", gatewayRoutes)

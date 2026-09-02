@@ -16,6 +16,7 @@ type Metrics struct {
 	Requests, Inflight, GeneratedTokens, Errors, Retries                     atomic.Int64
 	AdmissionRejections, SchedulerDecisions, SchedulerFailures, Reservations atomic.Int64
 	CachePredictedTokens, CacheActualTokens, CachePredictionMisses           atomic.Int64
+	ShadowAffinityMatches                                                    atomic.Int64
 	mu                                                                       sync.Mutex
 	requestDurationSum, ttftSum                                              float64
 	requestDurationCount, ttftCount                                          int64
@@ -67,6 +68,7 @@ func (m *Metrics) Handler(snapshots func() []registry.WorkerSnapshot, cacheStats
 			"distserve_cache_predicted_hit_tokens_total": float64(m.CachePredictedTokens.Load()),
 			"distserve_cache_actual_hit_tokens_total":    float64(m.CacheActualTokens.Load()),
 			"distserve_cache_prediction_misses_total":    float64(m.CachePredictionMisses.Load()),
+			"distserve_shadow_affinity_matches_total":    float64(m.ShadowAffinityMatches.Load()),
 		}
 		names := make([]string, 0, len(values))
 		for name := range values {

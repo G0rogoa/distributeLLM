@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -185,6 +186,95 @@ func TestVLLMBackendReceivesPlainOpenAIRequest(t *testing.T) {
 	}
 }
 
+func TestMultipleVLLMWorkersRoundRobinAndDebugDecisions(t *testing.T) {
+	servers := map[string]*countingVLLM{}
+	workers := registry.New(time.Second, 2*time.Second)
+	for _, id := range []string{"real-a", "real-b", "real-c"} {
+		server := newCountingVLLM(t)
+		servers[id] = server
+		if err := workers.Register(registry.Worker{ID: id, InstanceID: id + "-instance", Address: server.URL(), Models: []string{"mock-llm"}, BackendType: "vllm", Model: "mock-llm", Capacity: 4}); err != nil {
+			t.Fatal(err)
+		}
+		if err := workers.Heartbeat(id, id+"-instance", 0, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gw := gateway.NewDynamic(workers, &scheduler.RoundRobin{}, "mock-llm", time.Second, 8, false, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	controller := httptest.NewServer(gw.Handler())
+	defer controller.Close()
+	seen := map[string]int{}
+	for i := 0; i < 6; i++ {
+		req, _ := http.NewRequest(http.MethodPost, controller.URL+"/v1/chat/completions", strings.NewReader(`{"model":"mock-llm","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"stream":false}`))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status=%d", resp.StatusCode)
+		}
+		workerID := resp.Header.Get("X-DistServe-Worker-ID")
+		if workerID == "" {
+			t.Fatal("missing selected worker header")
+		}
+		seen[workerID]++
+	}
+	for id, server := range servers {
+		if seen[id] == 0 || server.Count() == 0 {
+			t.Fatalf("worker %s was not selected: headers=%v hits=%d", id, seen, server.Count())
+		}
+	}
+	resp, err := http.Get(controller.URL + "/internal/debug/decisions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var records []gateway.DecisionRecord
+	if err := json.NewDecoder(resp.Body).Decode(&records); err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 6 || len(records[len(records)-1].Candidates) != 3 {
+		t.Fatalf("decision records=%+v", records)
+	}
+}
+
+func TestVLLMWorkerFailureDoesNotLeakReservations(t *testing.T) {
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "busy", http.StatusServiceUnavailable)
+	}))
+	defer failing.Close()
+	success := newCountingVLLM(t)
+	workers := registry.New(time.Second, 2*time.Second)
+	for _, item := range []registry.Worker{
+		{ID: "real-a", InstanceID: "ia", Address: failing.URL, Models: []string{"mock-llm"}, BackendType: "vllm", Model: "mock-llm", Capacity: 1},
+		{ID: "real-b", InstanceID: "ib", Address: success.URL(), Models: []string{"mock-llm"}, BackendType: "vllm", Model: "mock-llm", Capacity: 1},
+	} {
+		if err := workers.Register(item); err != nil {
+			t.Fatal(err)
+		}
+		if err := workers.Heartbeat(item.ID, item.InstanceID, 0, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gw := gateway.NewDynamic(workers, &scheduler.RoundRobin{}, "mock-llm", time.Second, 8, true, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	controller := httptest.NewServer(gw.Handler())
+	defer controller.Close()
+	resp, err := http.Post(controller.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"mock-llm","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"stream":false}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("X-DistServe-Worker-ID") != "real-b" {
+		t.Fatalf("status=%d selected=%s", resp.StatusCode, resp.Header.Get("X-DistServe-Worker-ID"))
+	}
+	for _, snapshot := range workers.Snapshots() {
+		if snapshot.LocalReservations != 0 {
+			t.Fatalf("worker %s leaked %d", snapshot.ID, snapshot.LocalReservations)
+		}
+	}
+}
+
 func TestNonStreamingEndToEnd(t *testing.T) {
 	server, _ := setup(t, time.Second, time.Millisecond, time.Millisecond)
 	resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"mock-llm","messages":[{"role":"user","content":"hello"}],"max_tokens":2,"stream":false}`))
@@ -263,4 +353,39 @@ func eventuallyInactive(t *testing.T, worker *mockworker.Worker) {
 	if worker.Active() != 0 {
 		t.Fatal("worker request did not stop")
 	}
+}
+
+type countingVLLM struct {
+	server *httptest.Server
+	mu     sync.Mutex
+	count  int
+}
+
+func newCountingVLLM(t *testing.T) *countingVLLM {
+	t.Helper()
+	value := &countingVLLM{}
+	value.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		value.mu.Lock()
+		value.count++
+		value.mu.Unlock()
+		var received map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := received["distserve_cache"]; ok {
+			t.Fatalf("vLLM backend received distserve_cache: %v", received)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"cmpl","object":"chat.completion","model":"mock-llm","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	t.Cleanup(value.server.Close)
+	return value
+}
+
+func (v *countingVLLM) URL() string { return v.server.URL }
+
+func (v *countingVLLM) Count() int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.count
 }

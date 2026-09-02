@@ -25,7 +25,7 @@ Request Scheduler: cache locality, load, queue, stability
 
 - Stage 1，已完成：流式 Gateway、Mock Workers、Registry、健康跟踪、round-robin 和 least-loaded 调度、reservation、有界准入、重试、指标、生命周期记录和负载生成。
 - Stage 2，Mock 模式已完成：prompt identity、token blocks、prefix hashing、有界 Cache Index、Mock Worker LRU、cache events、prefix-aware scheduling、eviction 和 Cache Fill Reservations。
-- Stage 3，进行中：OpenAI-compatible/vLLM HTTP 后端适配器、轻量 Worker Agent、显式 tokenizer mode、vLLM 指标归一化，以及针对单个手动启动 GPU 后端的诚实 shadow cache affinity。
+- Stage 3，进行中：OpenAI-compatible/vLLM HTTP 后端适配器、轻量 Worker Agent、显式 tokenizer mode、vLLM 指标归一化、shadow cache affinity，以及静态多 vLLM Worker 的调度/debug/loadgen 支持。
 - Stage 4，计划中：Node Agent、GPU Observer、cooperative Lease、Resource Policy、Elasticity Manager、reclaim/cooldown、Interference Guard、Trace Replay、reclaim-risk-aware routing 和动态伸缩实验。
 - Stage 5，可选：单节点 prefill/decode 池和本地 KV transfer。跨节点 RDMA 和多节点 serving 不是当前目标。
 
@@ -41,14 +41,15 @@ DistServe 只观察聚合资源信号，只管理自己创建的 Workers，并�
 
 ## Stage 3 真实 vLLM 路径
 
-Stage 3 让 vLLM 留在 Controller 外部。先在一张已授权且空闲的 GPU 上手动启动一个 vLLM OpenAI server，再运行一个 `workeragent` 注册和观察它：
+Stage 3 让 vLLM 留在 Controller 外部。先在已授权且空闲的 GPU 上手动启动一个或多个 vLLM OpenAI servers，再为每个 server 运行一个 `workeragent` 注册和观察它：
 
 ```bash
 go run ./cmd/controller -listen=127.0.0.1:8080 -model=example-model -tokenizer-mode=disabled
 go run ./cmd/workeragent -worker-id=worker-gpu0 -gpu-index=0 -model=example-model -backend-url=http://127.0.0.1:8100
+go run ./cmd/workeragent -worker-id=worker-gpu1 -gpu-index=1 -model=example-model -backend-url=http://127.0.0.1:8101
 ```
 
-Controller 会向 `backend_type: vllm` 的 Worker 转发普通 OpenAI-compatible JSON，并保留 SSE streaming。它不会启动 vLLM、选择 GPU、kill 进程，也不会声称精确知道真实 KV block 驻留情况。更多说明见 `docs/real-vllm-integration.md`、`docs/real-cache-observability.md` 和 `docs/stage3-experiment-plan.md`。
+Controller 会向 `backend_type: vllm` 的 Worker 转发普通 OpenAI-compatible JSON，并保留 SSE streaming。响应头会带上本次选择的 Worker，`/internal/debug/decisions` 会保留最近的候选分数，便于静态多实例实验复盘。它不会启动 vLLM、选择 GPU、kill 进程，也不会声称精确知道真实 KV block 驻留情况。更多说明见 `docs/real-vllm-integration.md`、`docs/real-cache-observability.md` 和 `docs/stage3-experiment-plan.md`。
 
 ## 运行当前 Mock 控制面
 
@@ -89,7 +90,7 @@ go test -race ./...
 运行 load generator：
 
 ```bash
-go run ./cmd/loadgen -requests=100 -concurrency=8 -stream -format=json
+go run ./cmd/loadgen -model=mock-llm -requests=100 -concurrency=8 -stream -format=json -output=results.jsonl
 ```
 
-请求实验脚本在 `experiments/` 下。参见 `docs/benchmark-methodology.md` 和 `docs/stage4-benchmark-plan.md`。当前系统使用 timing-simulator Workers：它不会运行真实模型、分配 GPU KV tensors、自动 claim GPU、提供已认证控制 API，也没有实现 Stage 3-5 的全部能力。公开 Mock API 只支持 `model`、`messages`、`max_tokens`、`temperature` 和 `stream`；Controller 状态仍保存在内存中，内部 API 未认证。真实 vLLM 路径目前是单卡 smoke-test 集成，不是弹性 GPU 自动化或多 GPU benchmark 结果。
+请求实验脚本在 `experiments/` 下。参见 `docs/benchmark-methodology.md` 和 `docs/stage4-benchmark-plan.md`。当前系统使用 timing-simulator Workers：它不会运行真实模型、分配 GPU KV tensors、自动 claim GPU、提供已认证控制 API，也没有实现 Stage 3-5 的全部能力。公开 Mock API 只支持 `model`、`messages`、`max_tokens`、`temperature` 和 `stream`；Controller 状态仍保存在内存中，内部 API 未认证。真实 vLLM 路径已经完成单卡 smoke test，当前只支持手动启动的静态多实例实验，不是弹性 GPU 自动化或多 GPU benchmark 结果。

@@ -4,7 +4,7 @@ Stage 3 增加真实 backend 路径，但不替换 Mock Workers。Controller 仍
 
 ```text
 client -> controller -> scheduler -> registry reservation
-       -> vLLM HTTP adapter -> one vLLM OpenAI server -> SSE/JSON -> client
+       -> vLLM HTTP adapter -> selected vLLM OpenAI server -> SSE/JSON -> client
 ```
 
 Controller 只通过 HTTP 通信。它不 import Python、不 embed vLLM、不启动 model process、不终止 model process，也不推断 vLLM 内部 KV block placement。这让请求路径可以用 `httptest.Server` 测试，并把资源 ownership 留给后续 cooperative resource layer。
@@ -18,7 +18,9 @@ GPU 0 -> http://127.0.0.1:8100 -> workeragent worker-gpu0
 GPU 1 -> http://127.0.0.1:8101 -> workeragent worker-gpu1
 ```
 
-每个 agent 注册一个稳定 `worker_id`，并为本次进程启动生成新的 `instance_id`。Scheduler 继续从 Registry snapshots 选择，因此以后增加更多 single-GPU instances 时，不需要在 Controller 中硬编码端口或 GPU indices。
+每个 agent 注册一个稳定 `worker_id`，并为本次进程启动生成新的 `instance_id`。Scheduler 继续从 Registry snapshots 选择，因此增加更多 single-GPU instances 时，不需要在 Controller 中硬编码端口或 GPU indices。
+
+静态多实例实验只需要重复“启动 vLLM server + 启动 workeragent”这一步。Controller 会在响应头返回 `X-DistServe-Worker-ID`，并在 `/internal/debug/decisions` 保留最近的候选分数。`cmd/loadgen` 可以用 `-model` 指定真实模型名，用 `-output=results.jsonl` 保存每个请求的 selected worker，方便和 `/metrics`、vLLM logs 对齐。
 
 ## 无 GPU 本地运行
 
@@ -41,6 +43,7 @@ GPU_INDEX=0 MODEL=example-model PORT=8100 scripts/run-vllm-single-gpu.sh
 ```bash
 go run ./cmd/controller -listen=127.0.0.1:8080 -model=example-model -tokenizer-mode=disabled
 go run ./cmd/workeragent -worker-id=worker-gpu0 -gpu-index=0 -model=example-model -backend-url=http://127.0.0.1:8100
+go run ./cmd/workeragent -worker-id=worker-gpu1 -gpu-index=1 -model=example-model -backend-url=http://127.0.0.1:8101
 ```
 
 Smoke script 已提供，但不会自动执行：

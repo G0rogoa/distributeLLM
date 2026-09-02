@@ -36,11 +36,37 @@ type Decision struct {
 	SnapshotAge  time.Duration
 	CacheMatch   cache.PrefixMatch
 	ScoreDetails ScoreBreakdown
+	Candidates   []CandidateScore
 }
 
 type ScoreBreakdown struct {
-	MatchedTokens                                                                                                                                            int
-	CacheBenefit, RunningPenalty, QueuePenalty, ReservationPenalty, RemainingTokensPenalty, StalenessPenalty, CapacityPenalty, FillAffinityBonus, FinalScore float64
+	MatchedTokens int `json:"matched_tokens"`
+
+	CacheBenefit           float64 `json:"cache_benefit"`
+	RunningPenalty         float64 `json:"running_penalty"`
+	QueuePenalty           float64 `json:"queue_penalty"`
+	ReservationPenalty     float64 `json:"reservation_penalty"`
+	RemainingTokensPenalty float64 `json:"remaining_tokens_penalty"`
+	StalenessPenalty       float64 `json:"staleness_penalty"`
+	CapacityPenalty        float64 `json:"capacity_penalty"`
+	FillAffinityBonus      float64 `json:"fill_affinity_bonus"`
+	FinalScore             float64 `json:"final_score"`
+}
+
+type CandidateScore struct {
+	WorkerID                 string                `json:"worker_id"`
+	InstanceID               string                `json:"instance_id"`
+	BackendType              string                `json:"backend_type"`
+	Status                   registry.WorkerStatus `json:"status"`
+	Capacity                 int                   `json:"capacity"`
+	ReportedRunning          int                   `json:"reported_running"`
+	ReportedQueued           int                   `json:"reported_queued"`
+	LocalReservations        int                   `json:"local_reservations"`
+	EstimatedRemainingTokens int64                 `json:"estimated_remaining_tokens"`
+	Score                    float64               `json:"score"`
+	Reason                   string                `json:"reason"`
+	CacheMatch               cache.PrefixMatch     `json:"cache_match"`
+	ScoreDetails             ScoreBreakdown        `json:"score_details"`
 }
 
 type Scheduler interface {
@@ -62,7 +88,12 @@ func (s *RoundRobin) Select(ctx context.Context, request RequestMeta, workers []
 	}
 	index := int((s.next.Add(1) - 1) % uint64(len(candidates)))
 	worker := candidates[index]
-	return decision(s.Name(), worker, float64(worker.ReportedRunning+worker.LocalReservations), "round-robin eligible worker"), nil
+	result := decision(s.Name(), worker, float64(worker.ReportedRunning+worker.LocalReservations), "round-robin eligible worker")
+	result.Candidates = candidateSummaries(candidates, func(worker registry.WorkerSnapshot) (float64, string, cache.PrefixMatch, ScoreBreakdown) {
+		score := float64(worker.ReportedRunning + worker.LocalReservations)
+		return score, "round-robin eligible worker", cache.PrefixMatch{}, ScoreBreakdown{FinalScore: score}
+	})
+	return result, nil
 }
 
 type LeastLoaded struct {
@@ -89,6 +120,7 @@ func (s *PrefixAware) Select(ctx context.Context, request RequestMeta, workers [
 	}
 	bestScore := 0.0
 	best := make([]Decision, 0)
+	summaries := make([]CandidateScore, 0, len(candidates))
 	for _, worker := range candidates {
 		key := cache.WorkerInstanceKey{WorkerID: worker.ID, InstanceID: worker.InstanceID}
 		match := cache.PrefixMatch{}
@@ -115,6 +147,7 @@ func (s *PrefixAware) Select(ctx context.Context, request RequestMeta, workers [
 		candidate := decision(s.Name(), worker, details.FinalScore, reason)
 		candidate.CacheMatch = match
 		candidate.ScoreDetails = details
+		summaries = append(summaries, candidateSummary(worker, details.FinalScore, reason, match, details))
 		if len(best) == 0 || details.FinalScore > bestScore {
 			best = []Decision{candidate}
 			bestScore = details.FinalScore
@@ -126,6 +159,7 @@ func (s *PrefixAware) Select(ctx context.Context, request RequestMeta, workers [
 	chosen := best[int(s.next%uint64(len(best)))]
 	s.next++
 	s.mu.Unlock()
+	chosen.Candidates = summaries
 	return chosen, nil
 }
 
@@ -141,8 +175,11 @@ func (s *LeastLoaded) Select(ctx context.Context, request RequestMeta, workers [
 	}
 	best := make([]registry.WorkerSnapshot, 0, len(candidates))
 	bestScore := 0.0
+	summaries := make([]CandidateScore, 0, len(candidates))
 	for _, worker := range candidates {
 		score := float64(worker.ReportedRunning+worker.LocalReservations) + s.QueueWeight*float64(worker.ReportedQueued) + s.TokenWeight*float64(worker.EstimatedRemainingTokens)/1000
+		reason := fmt.Sprintf("candidate %s: effective_load=%.3f, healthy=true, model_match=true", worker.ID, score)
+		summaries = append(summaries, candidateSummary(worker, score, reason, cache.PrefixMatch{}, ScoreBreakdown{FinalScore: score}))
 		if len(best) == 0 || score < bestScore {
 			best, bestScore = []registry.WorkerSnapshot{worker}, score
 		} else if score == bestScore {
@@ -155,7 +192,9 @@ func (s *LeastLoaded) Select(ctx context.Context, request RequestMeta, workers [
 	s.mu.Unlock()
 	worker := best[index]
 	reason := fmt.Sprintf("selected %s: effective_load=%.3f, healthy=true, model_match=true", worker.ID, bestScore)
-	return decision(s.Name(), worker, bestScore, reason), nil
+	result := decision(s.Name(), worker, bestScore, reason)
+	result.Candidates = summaries
+	return result, nil
 }
 
 func eligible(model string, workers []registry.WorkerSnapshot) []registry.WorkerSnapshot {
@@ -185,4 +224,31 @@ func decision(strategy string, worker registry.WorkerSnapshot, score float64, re
 		age = 0
 	}
 	return Decision{WorkerID: worker.ID, InstanceID: worker.InstanceID, Strategy: strategy, Score: score, Reason: reason, SnapshotAge: age}
+}
+
+func candidateSummaries(workers []registry.WorkerSnapshot, score func(registry.WorkerSnapshot) (float64, string, cache.PrefixMatch, ScoreBreakdown)) []CandidateScore {
+	summaries := make([]CandidateScore, 0, len(workers))
+	for _, worker := range workers {
+		value, reason, match, details := score(worker)
+		summaries = append(summaries, candidateSummary(worker, value, reason, match, details))
+	}
+	return summaries
+}
+
+func candidateSummary(worker registry.WorkerSnapshot, score float64, reason string, match cache.PrefixMatch, details ScoreBreakdown) CandidateScore {
+	return CandidateScore{
+		WorkerID:                 worker.ID,
+		InstanceID:               worker.InstanceID,
+		BackendType:              worker.BackendType,
+		Status:                   worker.Status,
+		Capacity:                 worker.Capacity,
+		ReportedRunning:          worker.ReportedRunning,
+		ReportedQueued:           worker.ReportedQueued,
+		LocalReservations:        worker.LocalReservations,
+		EstimatedRemainingTokens: worker.EstimatedRemainingTokens,
+		Score:                    score,
+		Reason:                   reason,
+		CacheMatch:               match,
+		ScoreDetails:             details,
+	}
 }

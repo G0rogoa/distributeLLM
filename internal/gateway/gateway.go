@@ -43,6 +43,7 @@ type Gateway struct {
 	fillReservations *cache.FillReservations
 	shadowAffinity   *cache.AffinityIndex
 	backend          backend.Backend
+	decisions        *decisionStore
 }
 
 func (g *Gateway) ConfigureCache(runtime *cache.Runtime, fills *cache.FillReservations) {
@@ -70,7 +71,7 @@ func New(backendURL, model string, timeout time.Duration, client *http.Client, l
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Gateway{backendURL: strings.TrimRight(backendURL, "/"), model: model, timeout: timeout, client: client, log: logger, admission: admission.New(128), requests: lifecycle.New(1024), metrics: &telemetry.Metrics{}, backend: backend.OpenAIHTTP{Client: client}}
+	return &Gateway{backendURL: strings.TrimRight(backendURL, "/"), model: model, timeout: timeout, client: client, log: logger, admission: admission.New(128), requests: lifecycle.New(1024), metrics: &telemetry.Metrics{}, backend: backend.OpenAIHTTP{Client: client}, decisions: newDecisionStore(1024)}
 }
 
 func (g *Gateway) Handler() http.Handler {
@@ -81,6 +82,9 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/chat/completions", g.chatCompletions)
 	mux.HandleFunc("GET /internal/debug/requests", func(w http.ResponseWriter, _ *http.Request) {
 		g.DebugRequests(w)
+	})
+	mux.HandleFunc("GET /internal/debug/decisions", func(w http.ResponseWriter, _ *http.Request) {
+		g.DebugDecisions(w)
 	})
 	mux.HandleFunc("GET /internal/cache/requests/{id}", func(w http.ResponseWriter, r *http.Request) {
 		request, ok := g.requests.Find(r.PathValue("id"))
@@ -104,6 +108,10 @@ func (g *Gateway) Handler() http.Handler {
 
 func (g *Gateway) DebugRequests(w http.ResponseWriter) {
 	writeJSON(w, http.StatusOK, g.requests.Snapshot())
+}
+
+func (g *Gateway) DebugDecisions(w http.ResponseWriter) {
+	writeJSON(w, http.StatusOK, g.decisions.Snapshot())
 }
 
 func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -199,7 +207,13 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		record.CachePredictedBlocks, record.CachePredictedTokens = decision.CacheMatch.MatchedBlocks, decision.CacheMatch.MatchedTokens
 		record.CacheEvidence = string(decision.CacheMatch.Evidence)
 		record.ShadowAffinityMatch = decision.CacheMatch.Evidence == cache.EvidenceShadowEstimated
+		if record.ShadowAffinityMatch {
+			g.metrics.ShadowAffinityMatches.Add(1)
+		}
 		record.CacheViewState = string(decision.CacheMatch.CacheViewState)
+		w.Header().Set("X-DistServe-Worker-ID", decision.WorkerID)
+		w.Header().Set("X-DistServe-Instance-ID", decision.InstanceID)
+		w.Header().Set("X-DistServe-Backend-Type", record.BackendType)
 		bodyValue := any(input)
 		if worker.BackendType == "" || worker.BackendType == string(backend.TypeMock) {
 			transport := backend.ChatCompletionRequest{ChatCompletionRequest: input}
@@ -371,6 +385,7 @@ func (g *Gateway) selectWorker(ctx context.Context, requestID string, input api.
 		for _, worker := range snapshots {
 			if worker.ID == decision.WorkerID && worker.InstanceID == decision.InstanceID {
 				g.log.Info("scheduler decision", "request_id", requestID, "worker_id", decision.WorkerID, "instance_id", decision.InstanceID, "strategy", decision.Strategy, "score", decision.Score, "reason", decision.Reason)
+				g.decisions.Add(DecisionRecord{RequestID: requestID, DecidedAt: time.Now(), Strategy: decision.Strategy, WorkerID: decision.WorkerID, InstanceID: decision.InstanceID, Score: decision.Score, Reason: decision.Reason, Candidates: decision.Candidates, SnapshotAge: decision.SnapshotAge.String()})
 				g.metrics.SchedulerDecisions.Add(1)
 				g.metrics.RecordSelection(worker.ID)
 				g.metrics.Reservations.Add(1)
