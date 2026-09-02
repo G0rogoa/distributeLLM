@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"distserve/internal/api"
 	"errors"
 	"sort"
 	"sync"
@@ -29,29 +30,39 @@ type Worker struct {
 	InstanceID               string
 	Address                  string
 	Models                   []string
+	BackendType              string
+	Model                    string
+	GPUIndex                 *int
+	Labels                   map[string]string
 	Status                   WorkerStatus
 	Capacity                 int
 	ReportedRunning          int
 	ReportedQueued           int
 	EstimatedRemainingTokens int64
+	Load                     api.WorkerLoadSnapshot
 	LastHeartbeat            time.Time
 	Version                  uint64
 	localReservations        int
 }
 
 type WorkerSnapshot struct {
-	ID                       string       `json:"id"`
-	InstanceID               string       `json:"instance_id"`
-	Address                  string       `json:"address"`
-	Models                   []string     `json:"models"`
-	Status                   WorkerStatus `json:"status"`
-	Capacity                 int          `json:"capacity"`
-	ReportedRunning          int          `json:"reported_running"`
-	ReportedQueued           int          `json:"reported_queued"`
-	LocalReservations        int          `json:"local_reservations"`
-	EstimatedRemainingTokens int64        `json:"estimated_remaining_tokens"`
-	LastHeartbeat            time.Time    `json:"last_heartbeat"`
-	Version                  uint64       `json:"version"`
+	ID                       string                 `json:"id"`
+	InstanceID               string                 `json:"instance_id"`
+	Address                  string                 `json:"address"`
+	Models                   []string               `json:"models"`
+	BackendType              string                 `json:"backend_type"`
+	Model                    string                 `json:"model,omitempty"`
+	GPUIndex                 *int                   `json:"gpu_index,omitempty"`
+	Labels                   map[string]string      `json:"labels,omitempty"`
+	Status                   WorkerStatus           `json:"status"`
+	Capacity                 int                    `json:"capacity"`
+	ReportedRunning          int                    `json:"reported_running"`
+	ReportedQueued           int                    `json:"reported_queued"`
+	LocalReservations        int                    `json:"local_reservations"`
+	EstimatedRemainingTokens int64                  `json:"estimated_remaining_tokens"`
+	Load                     api.WorkerLoadSnapshot `json:"load,omitempty"`
+	LastHeartbeat            time.Time              `json:"last_heartbeat"`
+	Version                  uint64                 `json:"version"`
 }
 
 type Registry struct {
@@ -70,6 +81,12 @@ func (r *Registry) Register(worker Worker) error {
 	if worker.ID == "" || worker.InstanceID == "" || worker.Address == "" || len(worker.Models) == 0 || worker.Capacity < 1 {
 		return ErrInvalidWorker
 	}
+	if worker.BackendType == "" {
+		worker.BackendType = "mock"
+	}
+	if worker.Model == "" && len(worker.Models) > 0 {
+		worker.Model = worker.Models[0]
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	existing := r.workers[worker.ID]
@@ -77,11 +94,17 @@ func (r *Registry) Register(worker Worker) error {
 		// Registration is idempotent, but refreshes discoverable metadata.
 		existing.Address = worker.Address
 		existing.Models = append(existing.Models[:0], worker.Models...)
+		existing.BackendType = worker.BackendType
+		existing.Model = worker.Model
+		existing.GPUIndex = copyGPUIndex(worker.GPUIndex)
+		existing.Labels = copyLabels(worker.Labels)
 		existing.Capacity = worker.Capacity
 		existing.Version++
 		return nil
 	}
 	worker.Models = append([]string(nil), worker.Models...)
+	worker.GPUIndex = copyGPUIndex(worker.GPUIndex)
+	worker.Labels = copyLabels(worker.Labels)
 	worker.Status = StatusStarting
 	worker.LastHeartbeat = r.now()
 	if existing != nil {
@@ -94,6 +117,10 @@ func (r *Registry) Register(worker Worker) error {
 }
 
 func (r *Registry) Heartbeat(id, instanceID string, running, queued int, remaining int64) error {
+	return r.HeartbeatWithLoad(id, instanceID, running, queued, remaining, nil)
+}
+
+func (r *Registry) HeartbeatWithLoad(id, instanceID string, running, queued int, remaining int64, load *api.WorkerLoadSnapshot) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	worker := r.workers[id]
@@ -109,6 +136,9 @@ func (r *Registry) Heartbeat(id, instanceID string, running, queued int, remaini
 	worker.ReportedRunning = running
 	worker.ReportedQueued = queued
 	worker.EstimatedRemainingTokens = remaining
+	if load != nil {
+		worker.Load = *load
+	}
 	worker.LastHeartbeat = r.now()
 	if worker.Status != StatusDraining {
 		worker.Status = StatusHealthy
@@ -161,10 +191,29 @@ func (r *Registry) Snapshots() []WorkerSnapshot {
 	r.mu.RLock()
 	result := make([]WorkerSnapshot, 0, len(r.workers))
 	for _, worker := range r.workers {
-		result = append(result, WorkerSnapshot{ID: worker.ID, InstanceID: worker.InstanceID, Address: worker.Address, Models: append([]string(nil), worker.Models...), Status: worker.Status, Capacity: worker.Capacity, ReportedRunning: worker.ReportedRunning, ReportedQueued: worker.ReportedQueued, LocalReservations: worker.localReservations, EstimatedRemainingTokens: worker.EstimatedRemainingTokens, LastHeartbeat: worker.LastHeartbeat, Version: worker.Version})
+		result = append(result, WorkerSnapshot{ID: worker.ID, InstanceID: worker.InstanceID, Address: worker.Address, Models: append([]string(nil), worker.Models...), BackendType: worker.BackendType, Model: worker.Model, GPUIndex: copyGPUIndex(worker.GPUIndex), Labels: copyLabels(worker.Labels), Status: worker.Status, Capacity: worker.Capacity, ReportedRunning: worker.ReportedRunning, ReportedQueued: worker.ReportedQueued, LocalReservations: worker.localReservations, EstimatedRemainingTokens: worker.EstimatedRemainingTokens, Load: worker.Load, LastHeartbeat: worker.LastHeartbeat, Version: worker.Version})
 	}
 	r.mu.RUnlock()
 	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
+	return result
+}
+
+func copyGPUIndex(index *int) *int {
+	if index == nil {
+		return nil
+	}
+	value := *index
+	return &value
+}
+
+func copyLabels(labels map[string]string) map[string]string {
+	if len(labels) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(labels))
+	for key, value := range labels {
+		result[key] = value
+	}
 	return result
 }
 

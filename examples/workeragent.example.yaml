@@ -1,0 +1,22 @@
+controller:
+  listen: "127.0.0.1:8080"
+
+backend:
+  type: "vllm"
+  url: "http://127.0.0.1:8100"
+  model: "example-model"
+
+worker:
+  id: "worker-gpu0"
+  gpu_index: 0
+  heartbeat_interval: "2s"
+  health_timeout: "2s"
+  labels:
+    stage: "stage3"
+
+cache:
+  mode: "shadow"
+  shadow_ttl: "60s"
+
+tokenizer:
+  mode: "disabled"

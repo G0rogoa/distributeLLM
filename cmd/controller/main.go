@@ -19,6 +19,7 @@ import (
 
 func main() {
 	listen := flag.String("listen", ":8080", "controller listen address")
+	model := flag.String("model", "mock-llm", "served model name accepted by the controller")
 	timeout := flag.Duration("request-timeout", 30*time.Second, "end-to-end request timeout")
 	strategyName := flag.String("scheduler", "prefix-aware", "scheduler: prefix-aware, least-loaded or round-robin")
 	maxInFlight := flag.Int("max-inflight", 128, "maximum admitted requests")
@@ -27,6 +28,8 @@ func main() {
 	cacheDedup := flag.Int("cache-event-dedup", 10000, "remembered cache event IDs")
 	blockSize := flag.Int("cache-block-size", 16, "tokens per full cache block")
 	fillTTL := flag.Duration("cache-fill-ttl", 30*time.Second, "advisory cache fill reservation TTL")
+	shadowTTL := flag.Duration("shadow-affinity-ttl", 60*time.Second, "real backend shadow affinity TTL")
+	tokenizerMode := flag.String("tokenizer-mode", string(cache.TokenizerModeMock), "tokenizer mode: mock, remote or disabled")
 	flag.Parse()
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	if *fillTTL <= 0 || *blockSize < 1 {
@@ -45,8 +48,22 @@ func main() {
 	go cacheIndex.RunCleanup(ctx, 2*time.Second, 1000)
 	fills := cache.NewFillReservations(*fillTTL)
 	go fills.RunCleanup(ctx, time.Second)
-	identity := cache.CacheIdentity{ProtocolVersion: cache.PrefixProtocolVersion, ModelID: "mock-llm", ModelRevision: "v1", TokenizerID: "mock", TokenizerRevision: "v1", ChatTemplateVersion: "chat-v1", BlockSizeTokens: *blockSize, CacheFormatVersion: "mock-kv-v1"}
-	runtime := &cache.Runtime{Builder: cache.PromptBuilder{Identity: cache.PromptIdentity{ModelID: identity.ModelID, ModelRevision: identity.ModelRevision, TokenizerID: identity.TokenizerID, TokenizerRevision: identity.TokenizerRevision, ChatTemplateVersion: identity.ChatTemplateVersion}, MaxBytes: 1 << 20}, Tokenizer: &cache.DeterministicMockTokenizer{TokenizerID: cache.TokenizerIdentity{ID: identity.TokenizerID, Revision: identity.TokenizerRevision}, MaxInputBytes: 1 << 20, MaxTokens: 262144}, Identity: identity, Index: cacheIndex}
+	identity := cache.CacheIdentity{ProtocolVersion: cache.PrefixProtocolVersion, ModelID: *model, ModelRevision: "v1", TokenizerID: "mock", TokenizerRevision: "v1", ChatTemplateVersion: "chat-v1", BlockSizeTokens: *blockSize, CacheFormatVersion: "mock-kv-v1"}
+	var tokenizer cache.Tokenizer
+	switch cache.TokenizerMode(*tokenizerMode) {
+	case cache.TokenizerModeMock:
+		tokenizer = &cache.DeterministicMockTokenizer{TokenizerID: cache.TokenizerIdentity{ID: identity.TokenizerID, Revision: identity.TokenizerRevision}, MaxInputBytes: 1 << 20, MaxTokens: 262144}
+	case cache.TokenizerModeDisabled:
+		identity.TokenizerID = "disabled"
+		identity.TokenizerRevision = "none"
+		tokenizer = cache.DisabledTokenizer{}
+	case cache.TokenizerModeRemote:
+		tokenizer = cache.RemoteTokenizer{TokenizerID: cache.TokenizerIdentity{ID: identity.TokenizerID, Revision: identity.TokenizerRevision}}
+	default:
+		logger.Error("invalid tokenizer mode", "tokenizer_mode", *tokenizerMode)
+		os.Exit(2)
+	}
+	runtime := &cache.Runtime{Builder: cache.PromptBuilder{Identity: cache.PromptIdentity{ModelID: identity.ModelID, ModelRevision: identity.ModelRevision, TokenizerID: identity.TokenizerID, TokenizerRevision: identity.TokenizerRevision, ChatTemplateVersion: identity.ChatTemplateVersion}, MaxBytes: 1 << 20}, Tokenizer: tokenizer, Identity: identity, Index: cacheIndex}
 	var strategy scheduler.Scheduler
 	switch *strategyName {
 	case "round-robin":
@@ -64,8 +81,22 @@ func main() {
 	mux.Handle("/internal/cache/", cacheRoutes)
 	mux.Handle("POST /internal/workers/{id}/cache/events", cacheRoutes)
 	mux.Handle("/internal/", workerRegistry.Handler())
-	gw := gateway.NewDynamic(workerRegistry, strategy, "mock-llm", *timeout, *maxInFlight, *retry, nil, logger)
+	gw := gateway.NewDynamic(workerRegistry, strategy, *model, *timeout, *maxInFlight, *retry, nil, logger)
 	gw.ConfigureCache(runtime, fills)
+	shadowAffinity := cache.NewAffinityIndex(*shadowTTL)
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				shadowAffinity.CleanupExpired(1000)
+			}
+		}
+	}()
+	gw.ConfigureShadowAffinity(shadowAffinity)
 	gatewayRoutes := gw.Handler()
 	mux.Handle("GET /internal/cache/requests/{id}", gatewayRoutes)
 	mux.Handle("/", gatewayRoutes)

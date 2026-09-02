@@ -10,6 +10,13 @@ import (
 )
 
 type TokenID uint32
+type TokenizerMode string
+
+const (
+	TokenizerModeMock     TokenizerMode = "mock"
+	TokenizerModeRemote   TokenizerMode = "remote"
+	TokenizerModeDisabled TokenizerMode = "disabled"
+)
 
 type TokenizerIdentity struct {
 	ID       string
@@ -21,7 +28,33 @@ type Tokenizer interface {
 	Encode(context.Context, string) ([]TokenID, error)
 }
 
-var ErrTokenizerInputTooLarge = errors.New("tokenizer input exceeds size limit")
+var (
+	ErrTokenizerInputTooLarge = errors.New("tokenizer input exceeds size limit")
+	ErrTokenizerDisabled      = errors.New("tokenizer disabled")
+	ErrTokenizerUnavailable   = errors.New("tokenizer unavailable")
+)
+
+type DisabledTokenizer struct{}
+
+func (DisabledTokenizer) Identity() TokenizerIdentity {
+	return TokenizerIdentity{ID: "disabled", Revision: "none"}
+}
+func (DisabledTokenizer) Encode(context.Context, string) ([]TokenID, error) {
+	return nil, ErrTokenizerDisabled
+}
+
+type RemoteTokenizer struct {
+	TokenizerID TokenizerIdentity
+	URL         string
+}
+
+func (t RemoteTokenizer) Identity() TokenizerIdentity { return t.TokenizerID }
+func (t RemoteTokenizer) Encode(context.Context, string) ([]TokenID, error) {
+	if t.URL == "" {
+		return nil, ErrTokenizerUnavailable
+	}
+	return nil, ErrTokenizerUnavailable
+}
 
 type DeterministicMockTokenizer struct {
 	TokenizerID   TokenizerIdentity

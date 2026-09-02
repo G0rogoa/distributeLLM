@@ -2,12 +2,14 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
 type PrefixMatch struct {
 	WorkerID          string         `json:"worker_id"`
 	InstanceID        string         `json:"instance_id"`
+	Evidence          EvidenceState  `json:"evidence"`
 	MatchedBlocks     int            `json:"matched_blocks"`
 	MatchedTokens     int            `json:"matched_tokens"`
 	TotalFullBlocks   int            `json:"total_full_blocks"`
@@ -17,6 +19,14 @@ type PrefixMatch struct {
 	OldestLeaseExpiry time.Time      `json:"oldest_lease_expiry"`
 	CacheViewState    CacheViewState `json:"cache_view_state"`
 }
+
+type EvidenceState string
+
+const (
+	EvidenceUnknown         EvidenceState = "Unknown"
+	EvidenceMockExact       EvidenceState = "MockExact"
+	EvidenceShadowEstimated EvidenceState = "ShadowEstimated"
+)
 
 type RequestFeatures struct {
 	Identity         CacheIdentity
@@ -40,6 +50,9 @@ func (runtime *Runtime) Prepare(ctx context.Context, messages []PromptMessage) (
 	}
 	tokens, err := runtime.Tokenizer.Encode(ctx, built.Text)
 	if err != nil {
+		if errors.Is(err, ErrTokenizerDisabled) || errors.Is(err, ErrTokenizerUnavailable) {
+			return &RequestFeatures{Identity: runtime.Identity}, nil
+		}
 		return nil, err
 	}
 	blocks, err := BuildTokenBlocks(tokens, runtime.Identity.BlockSizeTokens, runtime.Builder.MaxBytes)
@@ -54,7 +67,7 @@ func (runtime *Runtime) Prepare(ctx context.Context, messages []PromptMessage) (
 }
 
 func (index *CacheIndex) Match(worker WorkerInstanceKey, identity CacheIdentity, blocks []PrefixBlock, totalTokens int, now time.Time) PrefixMatch {
-	match := PrefixMatch{WorkerID: worker.WorkerID, InstanceID: worker.InstanceID, TotalFullBlocks: len(blocks), TotalInputTokens: totalTokens}
+	match := PrefixMatch{WorkerID: worker.WorkerID, InstanceID: worker.InstanceID, Evidence: EvidenceUnknown, TotalFullBlocks: len(blocks), TotalInputTokens: totalTokens}
 	identityHash, err := identity.Hash()
 	if err != nil {
 		return match
@@ -86,6 +99,9 @@ func (index *CacheIndex) Match(worker WorkerInstanceKey, identity CacheIdentity,
 	}
 	if totalTokens > 0 {
 		match.MatchRatio = float64(match.MatchedTokens) / float64(totalTokens)
+	}
+	if match.MatchedBlocks > 0 {
+		match.Evidence = EvidenceMockExact
 	}
 	return match
 }

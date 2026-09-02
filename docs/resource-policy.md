@@ -1,10 +1,8 @@
-# Resource policy (planned Stage 4)
+# Resource policy（计划中的 Stage 4）
 
-Resource Policy converts immutable GPU, Lease, host-pressure, Worker-demand, and cache
-value snapshots into auditable decisions. It does not observe devices or manage
-processes itself.
+Resource Policy 会把 immutable GPU、Lease、host-pressure、Worker-demand 和 cache value snapshots 转换成可审计 decisions。它本身不观察设备，也不管理进程。
 
-## States and transitions
+## 状态和转换
 
 ```text
 Unavailable -> Observed -> Borrowable -> Claimed -> Reclaiming -> CoolingDown
@@ -12,24 +10,18 @@ Unavailable -> Observed -> Borrowable -> Claimed -> Reclaiming -> CoolingDown
                      +--------------------------------------+--------------+
 ```
 
-- `Unavailable`: outside the allowed set, no valid Lease, foreign compute present, or
-  unhealthy device.
-- `Observed`: monitored only; automatic start is forbidden.
-- `Borrowable`: valid authorization plus a continuously safe observation window.
-- `Claimed`: a DistServe-owned Worker uses the GPU.
-- `Reclaiming`: Lease expiry, foreign process, pressure, or administrator signal is
-  causing that Worker to drain and exit.
-- `CoolingDown`: temporary no-start interval after release to prevent oscillation.
+- `Unavailable`：不在 allowed set 中、没有有效 Lease、存在 foreign compute，或设备不健康。
+- `Observed`：只监控；禁止自动 start。
+- `Borrowable`：有效授权加上连续安全的 observation window。
+- `Claimed`：DistServe-owned Worker 正在使用该 GPU。
+- `Reclaiming`：Lease expiry、foreign process、pressure 或 administrator signal 正在促使该 Worker drain 并退出。
+- `CoolingDown`：release 后的临时 no-start 间隔，用于避免 oscillation。
 
-Policy is slow to enter and fast to exit. A momentary idle sample is insufficient.
-Any reclaim trigger overrides start value. Decisions use `Observe`, `StartWorker`,
-`KeepWorker`, `DrainWorker`, `StopWorker`, or `Cooldown`, with reason, score breakdown,
-decision time, validity, and input versions.
+Policy 进入要慢，退出要快。一次瞬时 idle sample 不够。任何 reclaim trigger 都会覆盖 start value。Decisions 使用 `Observe`、`StartWorker`、`KeepWorker`、`DrainWorker`、`StopWorker` 或 `Cooldown`，并带上 reason、score breakdown、decision time、validity 和 input versions。
 
-## Planned read-only models
+## 计划中的只读模型
 
-The Observer will publish aggregate snapshots; `ForeignProcessCount` records only the
-presence/count of non-DistServe compute processes, never their sensitive details.
+Observer 会发布 aggregate snapshots；`ForeignProcessCount` 只记录非 DistServe compute process 的存在和数量，绝不记录敏感细节。
 
 ```go
 type GPUSnapshot struct {
@@ -67,18 +59,11 @@ type ResourceDecision struct {
 }
 ```
 
-Production decisions will also retain a structured score breakdown and source
-versions. Request scheduling receives `ResourceStability` as copied features alongside
-cache/load features. Its planned score subtracts load, queue, staleness, and reclaim
-risk from cache benefit. Draining Workers are ineligible; near-expiry Workers avoid
-long requests; stable Workers retain hot prefixes; opportunistic Workers avoid costly
-warm-up. Admission contracts as the healthy Worker set shrinks and new Workers receive
-traffic gradually. No Scheduler interface receives an Observer or device-command
-capability.
+Production decisions 还会保留结构化 score breakdown 和 source versions。Request scheduling 会把 `ResourceStability` 作为拷贝后的 features，与 cache/load features 一起接收。计划中的 score 会从 cache benefit 中减去 load、queue、staleness 和 reclaim risk。Draining Workers 不可选；near-expiry Workers 避免长请求；stable Workers 保留 hot prefixes；opportunistic Workers 避免昂贵 warm-up。Healthy Worker set 缩小时 admission 会收缩，新 Workers 会逐步接收流量。任何 Scheduler interface 都不会拿到 Observer 或 device-command capability。
 
-## Planned safe configuration
+## 计划中的安全配置
 
-This schema is not implemented yet and must not be passed to the current binaries:
+这个 schema 尚未实现，不能传给当前 binaries：
 
 ```yaml
 deployment:
@@ -101,11 +86,6 @@ resource_policy:
   max_concurrent_model_loads: 1
 ```
 
-Startup validation will reject enabled policy without a nonempty allowed set and valid
-Lease, duplicate devices, invalid durations, contradictory thresholds, or limits above
-the allowed set. Thresholds are experimental starting points, not measured optima.
+Startup validation 会拒绝以下配置：enabled policy 但没有非空 allowed set 和有效 Lease、duplicate devices、invalid durations、contradictory thresholds，或 limits 超过 allowed set。Thresholds 是实验起点，不是 measured optima。
 
-Worker start is valuable only when expected safe lifetime exceeds model load, cache
-warm-up, and minimum useful service time. The explainable score separates demand and
-cache value from load, warm-up, reclaim, and interference costs. Initial policy uses
-explicit heuristics tuned through Trace Replay, not an opaque predictor.
+只有当 expected safe lifetime 超过 model load、cache warm-up 和 minimum useful service time 时，启动 Worker 才有价值。Explainable score 会把 demand/cache value 与 load、warm-up、reclaim 和 interference costs 分开。初始 policy 使用通过 Trace Replay 调优的显式 heuristics，而不是 opaque predictor。

@@ -1,46 +1,35 @@
-# Future stages
+# 后续阶段
 
-DistServe's roadmap is deliberately single-node. Resource elasticity extends the
-existing LLM request scheduler; it is not a separate GPU-monitoring product.
+DistServe 的路线图有意限制在单节点。Resource elasticity 是对现有 LLM request scheduler 的扩展，不是一个单独的 GPU monitoring 产品。
 
-## Stage 1: distributed inference control plane — complete
+## Stage 1：distributed inference control plane，已完成
 
-Gateway, standalone Mock Workers, Registry and heartbeats, round-robin and
-least-loaded scheduling, atomic reservations, SSE proxying, bounded admission,
-failure handling, telemetry, lifecycle records, and a Go load generator.
+Gateway、独立 Mock Workers、Registry 和 heartbeats、round-robin 与 least-loaded scheduling、atomic reservations、SSE proxying、有界 admission、failure handling、telemetry、lifecycle records，以及 Go load generator。
 
-## Stage 2: KV Cache-aware scheduling — complete in mock mode
+## Stage 2：KV Cache-aware scheduling，Mock 模式已完成
 
-Versioned prompt identity, deterministic mock tokenization, token blocks and prefix
-hash chains, a bounded lease-based Cache Index, Worker cache events, Mock Worker LRU,
-prefix-aware scheduling, eviction, and Cache Fill Reservations. Metadata is advisory
-and Workers verify hits locally.
+Versioned prompt identity、deterministic mock tokenization、token blocks 和 prefix hash chains、基于 lease 的有界 Cache Index、Worker cache events、Mock Worker LRU、prefix-aware scheduling、eviction 和 Cache Fill Reservations。Metadata 是 advisory，Workers 会本地验证 hits。
 
-## Stage 3: real single-node multi-GPU inference — planned
+## Stage 3：真实单节点 backend integration，进行中
 
-- Thin vLLM adapter and a tokenizer compatible with the served model.
-- One to five independent Workers, initially one Worker per A100.
-- Real TTFT, TPOT, throughput, tail latency, and prefix-cache observations.
-- Static 1→2→3→4→5 Worker scaling on the target single node.
+- OpenAI-compatible/vLLM HTTP adapter 和轻量 Worker Agent。
+- 显式 tokenizer modes：mock、disabled 和 remote placeholder。
+- 第一次 smoke 使用一张已授权空闲 GPU 上手动启动的 vLLM instance。
+- ShadowEstimated real-backend affinity 与 MockExact cache events 分开。
+- Registry metadata 已为 static multi-instance expansion 留接口，但不做自动化。
 
-## Stage 4: shared-resource elasticity — planned
+## Stage 4：shared-resource elasticity，计划中
 
-- Node Agent, GPU Observer, Cooperative Lease, Resource Policy, and Interference Guard.
-- Elasticity Manager with idempotent start, drain, stop, release verification, and
-  cooldown for DistServe-owned Workers.
-- Mock observation and sanitized Trace Replay before real-device integration.
-- Immutable resource-stability features for request scoring; the Scheduler never
-  invokes NVML or `nvidia-smi`.
-- Dynamic contraction/expansion, reclaim-risk, and interference experiments.
+- Node Agent、GPU Observer、Cooperative Lease、Resource Policy 和 Interference Guard。
+- Elasticity Manager，包含 idempotent start、drain、stop、release verification，以及 DistServe-owned Workers 的 cooldown。
+- 真实设备集成前先做 Mock observation 和 sanitized Trace Replay。
+- 用于 request scoring 的 immutable resource-stability features；Scheduler 永远不调用 NVML 或 `nvidia-smi`。
+- Dynamic contraction/expansion、reclaim-risk 和 interference experiments。
 
-Automatic mode remains disabled unless an allowed GPU set and valid Lease are
-configured. Kubernetes, Slurm, multi-node placement, and general-purpose cluster
-scheduling are outside this stage.
+Automatic mode 会保持 disabled，除非配置了 allowed GPU set 和 valid Lease。Kubernetes、Slurm、multi-node placement 和 general-purpose cluster scheduling 都不属于这个阶段。
 
-## Stage 5: optional single-node prefill/decode separation
+## Stage 5：可选的单节点 prefill/decode separation
 
-Evaluate aggregated Workers against 1P+3D, 2P+2D, and 3P+1D pools with explicit local
-KV transfer and failure semantics. This stage makes no cross-node RDMA claim.
+用显式 local KV transfer 和 failure semantics 评估 1P+3D、2P+2D、3P+1D 的聚合 Worker 方案。本阶段不声称 cross-node RDMA。
 
-Possible later work includes authenticated control APIs, durable state, fairness, and
-quotas. Those are not current capabilities.
+可能的后续工作包括 authenticated control APIs、durable state、fairness 和 quotas。这些目前都不是已有能力。

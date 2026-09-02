@@ -1,4 +1,4 @@
-# Elastic Worker lifecycle (planned Stage 4)
+# Elastic Worker lifecycle（计划中的 Stage 4）
 
 ```text
 Observed --Lease + stable idle--> Borrowable --start--> Starting
@@ -7,25 +7,10 @@ Draining --zero active or grace expiry--> Stopping --exit + release--> CoolingDo
 CoolingDown --timer--> Observed
 ```
 
-The Elasticity Manager starts only one Worker for a versioned GPU claim and limits
-concurrent model loads. Registration must match the expected Worker and instance IDs;
-readiness, not process creation, marks it Healthy. New Workers receive traffic
-gradually to avoid a load surge.
+Elasticity Manager 只会为一个 versioned GPU claim 启动一个 Worker，并限制 concurrent model loads。Registration 必须匹配预期的 Worker 和 instance IDs；标记 Healthy 的条件是 readiness，而不是 process creation。New Workers 会逐步接收 traffic，避免 load surge。
 
-On reclaim it first marks the instance Draining in Registry, so scheduling stops. It
-then reduces admission, waits for existing requests, and after the grace period cancels
-only requests belonging to that DistServe instance. Request and Cache Fill
-Reservations release on every exit path.
+Reclaim 时，它会先在 Registry 中把 instance 标记为 Draining，让 scheduling 停止。然后降低 admission，等待 existing requests，并在 grace period 后只 cancel 属于该 DistServe instance 的 requests。Request 和 Cache Fill Reservations 会在每个 exit path 上释放。
 
-Stop targets only the exact process handle created by DistServe. After exit, the
-manager invalidates that Worker instance in Cache Index, verifies GPU memory release,
-records an audit event, and enters cooldown. If exit or release cannot be verified, the
-GPU remains unavailable and is never treated as free. The manager never signals,
-pauses, reprioritizes, or adopts another user's process.
+Stop 只针对 DistServe 创建的 exact process handle。进程退出后，manager 会使该 Worker instance 在 Cache Index 中失效，验证 GPU memory release，记录 audit event，并进入 cooldown。如果 exit 或 release 无法验证，该 GPU 会保持 unavailable，绝不被视为 free。Manager 永不 signal、pause、reprioritize 或 adopt 其他用户的进程。
 
-Start, drain, stop, invalidation, and release verification are idempotent. A Worker
-instance version rejects stale or duplicate actions. Lease expiry, a foreign compute
-process, GPU/host pressure, Worker failure, or administrator stop can move any active
-state toward reclaim. No path skips cleanup merely because a timeout or cancellation
-occurred.
-
+Start、drain、stop、invalidation 和 release verification 都是 idempotent。Worker instance version 会拒绝 stale 或 duplicate actions。Lease expiry、foreign compute process、GPU/host pressure、Worker failure 或 administrator stop 都可以把任何 active state 推向 reclaim。没有路径会因为 timeout 或 cancellation 而跳过 cleanup。

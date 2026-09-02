@@ -1,8 +1,6 @@
-# Cooperative Lease (planned Stage 4)
+# Cooperative Lease（计划中的 Stage 4）
 
-A GPU Lease is group-recognized, temporary authorization; it is not ownership and it
-does not override manual coordination. No automatic Worker starts without both a valid
-Lease and an allowed GPU entry.
+GPU Lease 是组内认可的临时授权；它不是 ownership，也不会覆盖人工协调。没有有效 Lease 和 allowed GPU entry 时，不会自动启动 Worker。
 
 ```go
 type GPULease struct {
@@ -18,17 +16,8 @@ type GPULease struct {
 }
 ```
 
-The first provider will be `ManualLeaseProvider`: explicit local configuration with a
-required expiry. A future `FileLeaseProvider` is permitted only after the group agrees
-on the shared protocol and permissions; it must not assume a public directory.
+第一个 provider 会是 `ManualLeaseProvider`：显式本地配置，并要求 expiry。未来可以加入 `FileLeaseProvider`，但必须先经过组内对共享协议和权限的确认；它不能假设存在 public directory。
 
-Validation requires a stable Lease ID, exact GPU UUID, recognized priority, increasing
-version, creation before expiry, and bounded TTL. Expiry, unreadable/corrupt data,
-version rollback, duplicate active owners, or conflicting GPU claims fail closed.
-Refresh never silently extends authority. A higher-priority reclaim or expiry causes
-Draining; it does not authorize interference with another process.
+Validation 要求 stable Lease ID、exact GPU UUID、recognized priority、递增 version、creation before expiry，以及有界 TTL。Expiry、unreadable/corrupt data、version rollback、duplicate active owners 或 conflicting GPU claims 都会 fail closed。Refresh 绝不静默延长授权。更高优先级 reclaim 或 expiry 会导致 Draining；它不授权干扰其他进程。
 
-Lease snapshots expose only authorization metadata needed by policy. Audit records
-cover issue/refresh/expiry/conflict and resulting decisions without credentials or
-unnecessary personal/process information. Automatic mode remains disabled by default.
-
+Lease snapshots 只暴露 policy 所需的授权 metadata。Audit records 覆盖 issue/refresh/expiry/conflict 以及 resulting decisions，不包含 credentials 或不必要的 personal/process information。Automatic mode 默认保持关闭。

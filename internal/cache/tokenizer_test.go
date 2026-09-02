@@ -47,3 +47,15 @@ func TestMockTokenizerEmptyCancellationAndLimit(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+func TestDisabledTokenizerPreparesCacheUnawareFeatures(t *testing.T) {
+	identity := CacheIdentity{ProtocolVersion: PrefixProtocolVersion, ModelID: "m", ModelRevision: "r", TokenizerID: "disabled", TokenizerRevision: "none", ChatTemplateVersion: "ct", BlockSizeTokens: 4, CacheFormatVersion: "kv"}
+	runtime := Runtime{Builder: PromptBuilder{Identity: PromptIdentity{ModelID: "m", ModelRevision: "r", TokenizerID: "disabled", TokenizerRevision: "none", ChatTemplateVersion: "ct"}, MaxBytes: 1024}, Tokenizer: DisabledTokenizer{}, Identity: identity}
+	features, err := runtime.Prepare(context.Background(), []PromptMessage{{Role: "user", Content: "hello"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if features.TotalInputTokens != 0 || len(features.PrefixBlocks) != 0 {
+		t.Fatalf("features=%+v", features)
+	}
+}

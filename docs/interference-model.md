@@ -1,25 +1,15 @@
-# Interference model (planned Stage 4)
+# Interference model（计划中的 Stage 4）
 
-“Low interference” means keeping impact on other research tasks below agreed
-thresholds and releasing resources quickly and verifiably after a reclaim signal. It
-does not mean hidden use.
+“Low interference” 的意思是把对其他科研任务的影响控制在约定阈值以下，并在 reclaim signal 后快速且可验证地释放资源。它不表示隐蔽使用。
 
-The Interference Guard consumes aggregate, sanitized measurements:
+Interference Guard 消费 aggregate、sanitized measurements：
 
-- GPU compute utilization, memory use, temperature, power, and presence of a
-  non-DistServe compute process;
-- host CPU load, available memory, swap activity, and storage read/write rates;
-- DistServe model-loading bandwidth, Worker load, and measured release time.
+- GPU compute utilization、memory use、temperature、power，以及是否存在 non-DistServe compute process；
+- host CPU load、available memory、swap activity 和 storage read/write rates；
+- DistServe model-loading bandwidth、Worker load 和 measured release time。
 
-It does not collect usernames, full commands, environments, files, prompts, model
-contents, tokens, or credentials. It never sends signals to foreign processes.
+它不收集 usernames、full commands、environments、files、prompts、model contents、tokens 或 credentials。它永远不会向 foreign processes 发送 signals。
 
-When pressure rises, the response order is: stop new starts, reduce admission capacity,
-drain low-value/cold-cache Workers, then release additional DistServe GPUs if needed.
-Foreign compute presence or Lease expiry is a fast reclaim trigger. Model loads are
-serialized by default because they can stress CPU, memory, disk, and GPU concurrently.
+当 pressure 上升时，响应顺序是：停止 new starts，降低 admission capacity，drain low-value/cold-cache Workers，必要时释放更多 DistServe GPUs。Foreign compute presence 或 Lease expiry 是 fast reclaim trigger。Model loads 默认串行化，因为它们可能同时压 CPU、memory、disk 和 GPU。
 
-Every violation includes threshold, observed aggregate, duration, input freshness,
-action, and release latency. Thresholds remain configurable and must be calibrated by
-Trace Replay and authorized experiments rather than claimed as universal optima.
-
+每次 violation 都包含 threshold、observed aggregate、duration、input freshness、action 和 release latency。Thresholds 保持可配置，必须通过 Trace Replay 和授权实验校准，不能声称是 universal optima。

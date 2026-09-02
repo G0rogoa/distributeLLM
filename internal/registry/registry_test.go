@@ -76,6 +76,40 @@ func TestSnapshotIsDeepCopy(t *testing.T) {
 	}
 }
 
+func TestStage3MetadataIsCopiedAndMockDefaults(t *testing.T) {
+	r := New(time.Second, 2*time.Second)
+	gpu := 0
+	labels := map[string]string{"role": "real"}
+	worker := validWorker("instance")
+	worker.BackendType = "vllm"
+	worker.Model = "mock-llm"
+	worker.GPUIndex = &gpu
+	worker.Labels = labels
+	if err := r.Register(worker); err != nil {
+		t.Fatal(err)
+	}
+	labels["role"] = "changed"
+	gpu = 9
+	snapshot := r.Snapshots()[0]
+	if snapshot.BackendType != "vllm" || snapshot.Model != "mock-llm" || snapshot.GPUIndex == nil || *snapshot.GPUIndex != 0 || snapshot.Labels["role"] != "real" {
+		t.Fatalf("snapshot=%+v", snapshot)
+	}
+	snapshot.Labels["role"] = "mutated"
+	if got := r.Snapshots()[0].Labels["role"]; got != "real" {
+		t.Fatalf("registry labels were mutated: %q", got)
+	}
+	mock := validWorker("mock")
+	mock.ID = "mock-worker"
+	if err := r.Register(mock); err != nil {
+		t.Fatal(err)
+	}
+	for _, worker := range r.Snapshots() {
+		if worker.ID == "mock-worker" && worker.BackendType != "mock" {
+			t.Fatalf("mock default backend type=%q", worker.BackendType)
+		}
+	}
+}
+
 func TestConcurrentAccess(t *testing.T) {
 	r := New(time.Hour, 2*time.Hour)
 	for i := 0; i < 8; i++ {

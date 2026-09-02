@@ -41,11 +41,17 @@ type Gateway struct {
 	metrics          *telemetry.Metrics
 	cacheRuntime     *cache.Runtime
 	fillReservations *cache.FillReservations
+	shadowAffinity   *cache.AffinityIndex
+	backend          backend.Backend
 }
 
 func (g *Gateway) ConfigureCache(runtime *cache.Runtime, fills *cache.FillReservations) {
 	g.cacheRuntime = runtime
 	g.fillReservations = fills
+}
+
+func (g *Gateway) ConfigureShadowAffinity(index *cache.AffinityIndex) {
+	g.shadowAffinity = index
 }
 
 func NewDynamic(workerRegistry *registry.Registry, strategy scheduler.Scheduler, model string, timeout time.Duration, maxInFlight int, retry bool, client *http.Client, logger *slog.Logger) *Gateway {
@@ -64,7 +70,7 @@ func New(backendURL, model string, timeout time.Duration, client *http.Client, l
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Gateway{backendURL: strings.TrimRight(backendURL, "/"), model: model, timeout: timeout, client: client, log: logger, admission: admission.New(128), requests: lifecycle.New(1024), metrics: &telemetry.Metrics{}}
+	return &Gateway{backendURL: strings.TrimRight(backendURL, "/"), model: model, timeout: timeout, client: client, log: logger, admission: admission.New(128), requests: lifecycle.New(1024), metrics: &telemetry.Metrics{}, backend: backend.OpenAIHTTP{Client: client}}
 }
 
 func (g *Gateway) Handler() http.Handler {
@@ -160,7 +166,9 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid_request_error", "prompt_processing_failed", err.Error())
 			return
 		}
-		record.InputTokens = features.TotalInputTokens
+		if features.TotalInputTokens > 0 {
+			record.InputTokens = features.TotalInputTokens
+		}
 		record.CacheFullBlocks = len(features.PrefixBlocks)
 	}
 	var resp *http.Response
@@ -171,7 +179,7 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		maxAttempts = 2
 	}
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		backendURL, decision, selectedRelease, selectErr := g.selectWorker(ctx, requestID, input, started, features)
+		worker, decision, selectedRelease, selectErr := g.selectWorker(ctx, requestID, input, started, features)
 		if selectErr != nil {
 			err = selectErr
 			scheduleFailed = true
@@ -180,13 +188,23 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		release = selectedRelease
 		record.ScheduledAt = time.Now()
 		record.SelectedWorker, record.SelectedInstance, record.SchedulerStrategy = decision.WorkerID, decision.InstanceID, decision.Strategy
-		record.CachePredictedBlocks, record.CachePredictedTokens = decision.CacheMatch.MatchedBlocks, decision.CacheMatch.MatchedTokens
-		record.CacheViewState = string(decision.CacheMatch.CacheViewState)
-		transport := backend.ChatCompletionRequest{ChatCompletionRequest: input}
-		if features != nil {
-			transport.CacheHint = &cache.RoutingHint{Identity: features.Identity, PrefixBlocks: features.PrefixBlocks, TotalInputTokens: features.TotalInputTokens, PredictedMatchedBlocks: decision.CacheMatch.MatchedBlocks, PredictedMatchedTokens: decision.CacheMatch.MatchedTokens}
+		record.BackendType = worker.BackendType
+		if record.BackendType == "" {
+			record.BackendType = string(backend.TypeMock)
 		}
-		body, marshalErr := json.Marshal(transport)
+		record.CachePredictedBlocks, record.CachePredictedTokens = decision.CacheMatch.MatchedBlocks, decision.CacheMatch.MatchedTokens
+		record.CacheEvidence = string(decision.CacheMatch.Evidence)
+		record.ShadowAffinityMatch = decision.CacheMatch.Evidence == cache.EvidenceShadowEstimated
+		record.CacheViewState = string(decision.CacheMatch.CacheViewState)
+		bodyValue := any(input)
+		if worker.BackendType == "" || worker.BackendType == string(backend.TypeMock) {
+			transport := backend.ChatCompletionRequest{ChatCompletionRequest: input}
+			if features != nil {
+				transport.CacheHint = &cache.RoutingHint{Identity: features.Identity, PrefixBlocks: features.PrefixBlocks, TotalInputTokens: features.TotalInputTokens, PredictedMatchedBlocks: decision.CacheMatch.MatchedBlocks, PredictedMatchedTokens: decision.CacheMatch.MatchedTokens}
+			}
+			bodyValue = transport
+		}
+		body, marshalErr := json.Marshal(bodyValue)
 		if marshalErr != nil {
 			release()
 			err = marshalErr
@@ -203,26 +221,15 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		upstream, requestErr := http.NewRequestWithContext(ctx, http.MethodPost, backendURL+"/v1/chat/completions", bytes.NewReader(body))
-		if requestErr != nil {
-			if releaseFill != nil {
-				releaseFill()
-			}
-			release()
-			err = requestErr
-			break
-		}
-		upstream.Header.Set("Content-Type", "application/json")
-		upstream.Header.Set("X-Request-ID", requestID)
-		if decision.WorkerID != "" {
-			upstream.Header.Set("X-DistServe-Worker-ID", decision.WorkerID)
-		}
-		resp, err = g.client.Do(upstream)
+		header := r.Header.Clone()
+		header.Set("Content-Type", "application/json")
+		header.Set("X-Request-ID", requestID)
+		resp, err = g.backend.ChatCompletions(ctx, worker, backend.ChatRequest{Body: bytes.NewReader(body), Header: header, RequestID: requestID})
 		if releaseFill != nil {
 			releaseFill()
 		}
 		record.ForwardedAt = time.Now()
-		retryable := err != nil || (resp != nil && resp.StatusCode == http.StatusServiceUnavailable)
+		retryable := backend.Classify(err) == backend.ErrorConnection || backend.Classify(err) == backend.ErrorTimeout || (resp != nil && resp.StatusCode == http.StatusServiceUnavailable)
 		if !retryable || attempt+1 == maxAttempts || ctx.Err() != nil {
 			break
 		}
@@ -244,6 +251,17 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		g.metrics.Errors.Add(1)
 		if release != nil {
 			release()
+		}
+		if resp != nil {
+			defer resp.Body.Close()
+			w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+			if w.Header().Get("Content-Type") == "" {
+				w.Header().Set("Content-Type", "application/json")
+			}
+			w.WriteHeader(resp.StatusCode)
+			_, _ = io.Copy(w, io.LimitReader(resp.Body, 1<<20))
+			g.logResult(requestID, started, time.Time{}, err)
+			return
 		}
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			writeError(w, http.StatusGatewayTimeout, "timeout_error", "request_timeout", "request timed out")
@@ -289,8 +307,13 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		record.FinalStatus = "completed"
 		record.CompletedAt = time.Now()
-		record.OutputTokens = input.MaxTokens
-		g.metrics.GeneratedTokens.Add(int64(input.MaxTokens))
+		if record.BackendType == string(backend.TypeMock) {
+			record.OutputTokens = input.MaxTokens
+			g.metrics.GeneratedTokens.Add(int64(input.MaxTokens))
+		}
+		if g.shadowAffinity != nil && features != nil && record.BackendType == string(backend.TypeVLLM) {
+			g.shadowAffinity.RecordShadow(cache.WorkerInstanceKey{WorkerID: record.SelectedWorker, InstanceID: record.SelectedInstance}, features.Identity, features.PrefixBlocks, features.TotalInputTokens)
+		}
 	} else {
 		g.metrics.Errors.Add(1)
 		record.FinalStatus = "failed"
@@ -299,9 +322,9 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	g.logResult(requestID, started, firstToken, err)
 }
 
-func (g *Gateway) selectWorker(ctx context.Context, requestID string, input api.ChatCompletionRequest, arrival time.Time, features *cache.RequestFeatures) (string, scheduler.Decision, func(), error) {
+func (g *Gateway) selectWorker(ctx context.Context, requestID string, input api.ChatCompletionRequest, arrival time.Time, features *cache.RequestFeatures) (registry.WorkerSnapshot, scheduler.Decision, func(), error) {
 	if g.registry == nil || g.scheduler == nil {
-		return g.backendURL, scheduler.Decision{}, func() {}, nil
+		return registry.WorkerSnapshot{Address: g.backendURL, BackendType: string(backend.TypeMock), Models: []string{g.model}, Capacity: 1, Status: registry.StatusHealthy}, scheduler.Decision{}, func() {}, nil
 	}
 	meta := scheduler.RequestMeta{RequestID: requestID, Model: input.Model, InputTokens: approximateInputTokens(input.Messages), MaxOutputTokens: input.MaxTokens, Streaming: input.Stream, ArrivalTime: arrival, Cache: features}
 	if deadline, ok := ctx.Deadline(); ok {
@@ -323,13 +346,19 @@ func (g *Gateway) selectWorker(ctx context.Context, requestID string, input api.
 			for _, worker := range snapshots {
 				key := cache.WorkerInstanceKey{WorkerID: worker.ID, InstanceID: worker.InstanceID}
 				features.Matches[key] = g.cacheRuntime.Index.Match(key, features.Identity, features.PrefixBlocks, features.TotalInputTokens, time.Now())
+				if worker.BackendType == string(backend.TypeVLLM) && g.shadowAffinity != nil {
+					shadow := g.shadowAffinity.Match(key, features.Identity, features.PrefixBlocks, features.TotalInputTokens)
+					if shadow.MatchedTokens > features.Matches[key].MatchedTokens {
+						features.Matches[key] = shadow
+					}
+				}
 				features.FillAffinity[key] = key == affinity
 			}
 		}
 		decision, err := g.scheduler.Select(ctx, meta, snapshots)
 		if err != nil {
 			g.metrics.SchedulerFailures.Add(1)
-			return "", scheduler.Decision{}, nil, fmt.Errorf("schedule request: %w", err)
+			return registry.WorkerSnapshot{}, scheduler.Decision{}, nil, fmt.Errorf("schedule request: %w", err)
 		}
 		release, err := g.registry.Reserve(decision.WorkerID, decision.InstanceID)
 		if err != nil {
@@ -343,12 +372,13 @@ func (g *Gateway) selectWorker(ctx context.Context, requestID string, input api.
 				g.metrics.Reservations.Add(1)
 				var once sync.Once
 				trackedRelease := func() { once.Do(func() { release(); g.metrics.Reservations.Add(-1) }) }
-				return strings.TrimRight(worker.Address, "/"), decision, trackedRelease, nil
+				worker.Address = strings.TrimRight(worker.Address, "/")
+				return worker, decision, trackedRelease, nil
 			}
 		}
 		release()
 	}
-	return "", scheduler.Decision{}, nil, registry.ErrWorkerUnavailable
+	return registry.WorkerSnapshot{}, scheduler.Decision{}, nil, registry.ErrWorkerUnavailable
 }
 
 func approximateInputTokens(messages []api.Message) int {

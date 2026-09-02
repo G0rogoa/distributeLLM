@@ -1,21 +1,13 @@
 # API
 
-## Public
+## 公开接口
 
-`POST /v1/chat/completions` accepts `model`, `messages`, `max_tokens`,
-`temperature`, and `stream`. The only model is `mock-llm`; `max_tokens` is 1–4096.
-Streaming responses use `text/event-stream` and finish with `data: [DONE]`.
-`X-Request-ID` is accepted or generated and returned. `GET /health` reports process
-health and `GET /metrics` returns Prometheus text exposition.
+`POST /v1/chat/completions` 接受 `model`、`messages`、`max_tokens`、`temperature` 和 `stream`。Controller 接受配置中的 model；默认是 `mock-llm`。`max_tokens` 范围是 1-4096。流式响应使用 `text/event-stream`，并以 `data: [DONE]` 结束。`X-Request-ID` 可以由客户端传入，也可以由 Controller 生成并返回。`GET /health` 报告进程健康状态，`GET /metrics` 返回 Prometheus 文本格式指标。
 
-## Internal experimental API
+## 内部实验 API
 
-`POST /internal/workers/register`, `POST /internal/workers/{id}/heartbeat`,
-`POST /internal/workers/{id}/drain`, `GET /internal/workers`, and
-`GET /internal/debug/requests` are unauthenticated lab endpoints. Production use must
-place them on an isolated listener with authentication and authorization.
+`POST /internal/workers/register`、`POST /internal/workers/{id}/heartbeat`、`POST /internal/workers/{id}/drain`、`GET /internal/workers` 和 `GET /internal/debug/requests` 是未认证的实验室内部端点。生产使用必须把它们放在隔离 listener 后，并加上认证和授权。
 
-Errors use an OpenAI-like `{ "error": { "message", "type", "code" } }` envelope at
-the Gateway. Important status codes are 400 invalid input/model, 429 controller
-admission rejection, 503 no eligible worker/worker queue full, 504 deadline, and 502
-worker transport failure.
+注册请求需要 `id`、`instance_id`、`address`、`models` 和 `capacity`。Stage 3 Worker 还可以发送 `backend_type`、`model`、`gpu_index` 和 `labels`。缺失 `backend_type` 时会默认使用 `mock`，以兼容现有 Mock Workers。Heartbeat 需要 `instance_id` 和已报告的 running/queued work。真实 Worker Agent 还可以带一个归一化后的 `load` 对象；其中每个指标都是 optional，缺失的 vLLM 指标表示 unknown，而不是 0。
+
+Gateway 错误使用类似 OpenAI 的 `{ "error": { "message", "type", "code" } }` envelope。重要状态码包括：400 表示输入/model 无效，429 表示 Controller admission rejection，503 表示无 eligible worker 或 Worker queue full，504 表示 deadline，502 表示 worker transport failure。

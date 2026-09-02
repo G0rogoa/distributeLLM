@@ -16,6 +16,7 @@ type Request struct {
 	FailedAt             time.Time `json:"failed_at,omitempty"`
 	SelectedWorker       string    `json:"selected_worker,omitempty"`
 	SelectedInstance     string    `json:"selected_instance,omitempty"`
+	BackendType          string    `json:"backend_type,omitempty"`
 	SchedulerStrategy    string    `json:"scheduler_strategy,omitempty"`
 	RetryCount           int       `json:"retry_count"`
 	InputTokens          int       `json:"input_tokens"`
@@ -25,6 +26,8 @@ type Request struct {
 	CacheFullBlocks      int       `json:"cache_full_blocks"`
 	CachePredictedBlocks int       `json:"cache_predicted_blocks"`
 	CachePredictedTokens int       `json:"cache_predicted_tokens"`
+	CacheEvidence        string    `json:"cache_evidence,omitempty"`
+	ShadowAffinityMatch  bool      `json:"shadow_affinity_match"`
 	CacheActualBlocks    int       `json:"cache_actual_blocks"`
 	CacheActualTokens    int       `json:"cache_actual_tokens"`
 	CacheViewState       string    `json:"cache_view_state,omitempty"`

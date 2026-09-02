@@ -149,6 +149,42 @@ func TestRetriesOnceBeforeResponseStarts(t *testing.T) {
 	}
 }
 
+func TestVLLMBackendReceivesPlainOpenAIRequest(t *testing.T) {
+	var received map[string]any
+	vllm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"cmpl","object":"chat.completion","model":"mock-llm","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer vllm.Close()
+	workers := registry.New(time.Second, 2*time.Second)
+	if err := workers.Register(registry.Worker{ID: "real-1", InstanceID: "instance-1", Address: vllm.URL, Models: []string{"mock-llm"}, BackendType: "vllm", Model: "mock-llm", Capacity: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := workers.Heartbeat("real-1", "instance-1", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	identity := cache.CacheIdentity{ProtocolVersion: cache.PrefixProtocolVersion, ModelID: "mock-llm", ModelRevision: "v1", TokenizerID: "mock", TokenizerRevision: "v1", ChatTemplateVersion: "chat-v1", BlockSizeTokens: 4, CacheFormatVersion: "mock-kv-v1"}
+	runtime := &cache.Runtime{Builder: cache.PromptBuilder{Identity: cache.PromptIdentity{ModelID: identity.ModelID, ModelRevision: identity.ModelRevision, TokenizerID: identity.TokenizerID, TokenizerRevision: identity.TokenizerRevision, ChatTemplateVersion: identity.ChatTemplateVersion}, MaxBytes: 1 << 20}, Tokenizer: &cache.DeterministicMockTokenizer{TokenizerID: cache.TokenizerIdentity{ID: "mock", Revision: "v1"}, MaxInputBytes: 1 << 20, MaxTokens: 1000}, Identity: identity}
+	gw := gateway.NewDynamic(workers, &scheduler.RoundRobin{}, "mock-llm", time.Second, 8, false, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	gw.ConfigureCache(runtime, nil)
+	controller := httptest.NewServer(gw.Handler())
+	defer controller.Close()
+	resp, err := http.Post(controller.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"mock-llm","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"stream":false}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	if _, ok := received["distserve_cache"]; ok {
+		t.Fatalf("real backend received mock cache hint: %v", received)
+	}
+}
+
 func TestNonStreamingEndToEnd(t *testing.T) {
 	server, _ := setup(t, time.Second, time.Millisecond, time.Millisecond)
 	resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"mock-llm","messages":[{"role":"user","content":"hello"}],"max_tokens":2,"stream":false}`))

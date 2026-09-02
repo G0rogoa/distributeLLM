@@ -38,7 +38,7 @@ func (r *Registry) handleRegister(w http.ResponseWriter, request *http.Request) 
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
-	err := r.Register(Worker{ID: input.ID, InstanceID: input.InstanceID, Address: input.Address, Models: input.Models, Capacity: input.Capacity})
+	err := r.Register(Worker{ID: input.ID, InstanceID: input.InstanceID, Address: input.Address, Models: input.Models, BackendType: input.BackendType, Model: input.Model, GPUIndex: input.GPUIndex, Labels: input.Labels, Capacity: input.Capacity})
 	writeRegistryResult(w, err)
 }
 
@@ -48,7 +48,7 @@ func (r *Registry) handleHeartbeat(w http.ResponseWriter, request *http.Request)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
-	err := r.Heartbeat(request.PathValue("id"), input.InstanceID, input.ReportedRunning, input.ReportedQueued, input.EstimatedRemainingTokens)
+	err := r.HeartbeatWithLoad(request.PathValue("id"), input.InstanceID, input.ReportedRunning, input.ReportedQueued, input.EstimatedRemainingTokens, input.Load)
 	writeRegistryResult(w, err)
 }
 
