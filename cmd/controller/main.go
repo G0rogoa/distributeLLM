@@ -97,7 +97,9 @@ func main() {
 	gatewayRoutes := gw.Handler()
 	mux.Handle("/internal/cache/", cacheRoutes)
 	mux.Handle("POST /internal/workers/{id}/cache/events", cacheRoutes)
-	mux.Handle("GET /internal/debug/requests", gatewayRoutes)
+	mux.HandleFunc("GET /internal/debug/requests", func(w http.ResponseWriter, _ *http.Request) {
+		gw.DebugRequests(w)
+	})
 	mux.Handle("/internal/", workerRegistry.Handler())
 	mux.Handle("GET /internal/cache/requests/{id}", gatewayRoutes)
 	mux.Handle("/", gatewayRoutes)

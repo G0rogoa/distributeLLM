@@ -80,7 +80,7 @@ func (g *Gateway) Handler() http.Handler {
 	})
 	mux.HandleFunc("POST /v1/chat/completions", g.chatCompletions)
 	mux.HandleFunc("GET /internal/debug/requests", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, g.requests.Snapshot())
+		g.DebugRequests(w)
 	})
 	mux.HandleFunc("GET /internal/cache/requests/{id}", func(w http.ResponseWriter, r *http.Request) {
 		request, ok := g.requests.Find(r.PathValue("id"))
@@ -100,6 +100,10 @@ func (g *Gateway) Handler() http.Handler {
 	}
 	mux.HandleFunc("GET /metrics", g.metrics.Handler(snapshots, cacheStats))
 	return mux
+}
+
+func (g *Gateway) DebugRequests(w http.ResponseWriter) {
+	writeJSON(w, http.StatusOK, g.requests.Snapshot())
 }
 
 func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
