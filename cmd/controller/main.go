@@ -76,11 +76,6 @@ func main() {
 		logger.Error("invalid scheduler", "scheduler", *strategyName)
 		os.Exit(2)
 	}
-	mux := http.NewServeMux()
-	cacheRoutes := (&cachehttp.Handler{Index: cacheIndex, Registry: workerRegistry}).Routes()
-	mux.Handle("/internal/cache/", cacheRoutes)
-	mux.Handle("POST /internal/workers/{id}/cache/events", cacheRoutes)
-	mux.Handle("/internal/", workerRegistry.Handler())
 	gw := gateway.NewDynamic(workerRegistry, strategy, *model, *timeout, *maxInFlight, *retry, nil, logger)
 	gw.ConfigureCache(runtime, fills)
 	shadowAffinity := cache.NewAffinityIndex(*shadowTTL)
@@ -97,7 +92,13 @@ func main() {
 		}
 	}()
 	gw.ConfigureShadowAffinity(shadowAffinity)
+	mux := http.NewServeMux()
+	cacheRoutes := (&cachehttp.Handler{Index: cacheIndex, Registry: workerRegistry}).Routes()
 	gatewayRoutes := gw.Handler()
+	mux.Handle("/internal/cache/", cacheRoutes)
+	mux.Handle("POST /internal/workers/{id}/cache/events", cacheRoutes)
+	mux.Handle("GET /internal/debug/requests", gatewayRoutes)
+	mux.Handle("/internal/", workerRegistry.Handler())
 	mux.Handle("GET /internal/cache/requests/{id}", gatewayRoutes)
 	mux.Handle("/", gatewayRoutes)
 	server := &http.Server{Addr: *listen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
