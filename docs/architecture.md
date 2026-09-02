@@ -81,6 +81,8 @@ Gateway prepare -> Scheduler.Select -> Registry.Reserve
 
 Cache evidence 必须显式标注。Mock cache events 产生 `MockExact` metadata。真实请求可以产生短 TTL 的 `ShadowEstimated` affinity，并绑定到 `worker_id + instance_id + cache identity`。未知或过期信息是 `Unknown`。vLLM 聚合 prefix-cache metrics 是观测信号，不证明某个具体 prefix 驻留在某个具体 Worker 上。
 
+Stage 3C 增加 remote tokenizer sidecar 和 `ect` scheduler。Sidecar 使用与 vLLM 相同的本地 tokenizer 文件，并返回真实 token IDs；Controller 使用完整 `CacheIdentity` 生成 prefix hash。Remote tokenizer 不可用、超时或 identity mismatch 时，请求降级为 cache-unaware 并继续推理。`ect` scheduler 估计每个候选 Worker 的 completion time，把 uncached prefill、decode、running/waiting、local reservation、remaining tokens 和 shadow cache benefit 放进同一个可解释 score。
+
 ## 计划中的单节点资源层
 
 Stage 4 会在现有请求路径周围增加一个更慢的资源控制循环，而不是嵌进请求路径：

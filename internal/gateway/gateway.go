@@ -102,7 +102,11 @@ func (g *Gateway) Handler() http.Handler {
 	if g.cacheRuntime != nil && g.cacheRuntime.Index != nil {
 		cacheStats = g.cacheRuntime.Index.Stats
 	}
-	mux.HandleFunc("GET /metrics", g.metrics.Handler(snapshots, cacheStats))
+	var affinityStats func() cache.AffinityStats
+	if g.shadowAffinity != nil {
+		affinityStats = g.shadowAffinity.Stats
+	}
+	mux.HandleFunc("GET /metrics", g.metrics.Handler(snapshots, cacheStats, affinityStats))
 	return mux
 }
 
@@ -182,6 +186,10 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			record.InputTokens = features.TotalInputTokens
 		}
 		record.CacheFullBlocks = len(features.PrefixBlocks)
+		record.TokenizerFallback = features.TokenizerFallback
+		if features.TokenizerFallback {
+			g.metrics.TokenizerFallbacks.Add(1)
+		}
 	}
 	var resp *http.Response
 	var release func()

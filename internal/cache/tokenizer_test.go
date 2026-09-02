@@ -49,7 +49,7 @@ func TestMockTokenizerEmptyCancellationAndLimit(t *testing.T) {
 }
 
 func TestDisabledTokenizerPreparesCacheUnawareFeatures(t *testing.T) {
-	identity := CacheIdentity{ProtocolVersion: PrefixProtocolVersion, ModelID: "m", ModelRevision: "r", TokenizerID: "disabled", TokenizerRevision: "none", ChatTemplateVersion: "ct", BlockSizeTokens: 4, CacheFormatVersion: "kv"}
+	identity := CacheIdentity{ProtocolVersion: PrefixProtocolVersion, ModelID: "m", ModelRevision: "r", TokenizerID: "disabled", TokenizerRevision: "none", ChatTemplateVersion: "ct", BlockSizeTokens: 4, CacheFormatVersion: "kv", KVLayout: "test-fp16"}
 	runtime := Runtime{Builder: PromptBuilder{Identity: PromptIdentity{ModelID: "m", ModelRevision: "r", TokenizerID: "disabled", TokenizerRevision: "none", ChatTemplateVersion: "ct"}, MaxBytes: 1024}, Tokenizer: DisabledTokenizer{}, Identity: identity}
 	features, err := runtime.Prepare(context.Background(), []PromptMessage{{Role: "user", Content: "hello"}})
 	if err != nil {

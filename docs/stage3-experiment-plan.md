@@ -40,3 +40,28 @@ nvidia-smi
 - project processes 已退出的确认。
 
 不要从这个 smoke test 报告 throughput、cache hit rate、scaling efficiency 或 multi-GPU 结论。
+
+## Stage 3C 双卡 Cache-aware 对照
+
+真实 cache-aware 实验必须先完成 no-GPU 测试，然后人工确认两张候选 GPU 都没有其他用户进程。实验只使用手动启动的 vLLM servers、tokenizer sidecar、Controller 和 workeragents；不启动 Stage 4 自动资源层。
+
+最小 case：
+
+- 单卡 baseline：一个 vLLM Worker，`-scheduler=round-robin`。
+- 双卡 baseline：两个 vLLM Workers，`-scheduler=round-robin`。
+- 双卡 cache-aware：两个 vLLM Workers，`-scheduler=ect`，`-tokenizer-mode=remote`。
+
+每个 case 使用同一个 workload JSONL，至少重复三次。Workload 行应包含 `group`、`prompt` 或 `input_tokens`、`output_tokens`；hot-prefix 组用于观察 shadow affinity，cold/uniform 组用于确认调度没有只优化单一模式。
+
+必须保存：
+
+- 前后 `nvidia-smi`；
+- tokenizer sidecar identity；
+- Controller、workeragent、vLLM command lines；
+- loadgen summary 和 per-request JSONL；
+- `/metrics` 和 `/internal/debug/decisions`；
+- Controller/agent/vLLM logs；
+- tokenizer fallback 总数和比例；
+- worker selection 分布、TTFT、TPOT、总延迟和 HTTP status。
+
+如果 tokenizer fallback 非零，需要把对应请求单独列出。只有在有单卡 baseline、双卡 baseline、双卡 cache-aware、重复运行和完整采集时，才可以写性能优化结论。

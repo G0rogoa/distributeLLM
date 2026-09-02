@@ -25,7 +25,7 @@ func TestReadWorkloadJSONL(t *testing.T) {
 
 func TestWriteResultsJSONL(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "results.jsonl")
-	results := []result{{JobID: "a", RequestID: "req-a", Status: 200, Latency: 10 * time.Millisecond, TTFT: time.Millisecond, SelectedWorker: "worker-1", SelectedInstance: "instance-1", BackendType: "vllm"}}
+	results := []result{{JobID: "a", Group: "hot", RequestID: "req-a", Status: 200, Latency: 10 * time.Millisecond, TTFT: time.Millisecond, SelectedWorker: "worker-1", SelectedInstance: "instance-1", BackendType: "vllm", RequestedInput: 16, RequestedOutput: 4, PromptTokens: 20, CompletionTokens: 4, TotalTokens: 24}}
 	if err := writeResultsJSONL(path, results); err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func TestWriteResultsJSONL(t *testing.T) {
 	if err := json.Unmarshal(content, &record); err != nil {
 		t.Fatal(err)
 	}
-	if record.JobID != "a" || record.SelectedWorkerID != "worker-1" || record.LatencyMS != 10 {
+	if record.JobID != "a" || record.Group != "hot" || record.SelectedWorkerID != "worker-1" || record.LatencyMS != 10 || record.PromptTokens != 20 || record.RequestedOutput != 4 {
 		t.Fatalf("record=%+v", record)
 	}
 }

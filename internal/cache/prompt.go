@@ -13,12 +13,12 @@ var (
 )
 
 type PromptIdentity struct {
-	ModelID             string
-	ModelRevision       string
-	TokenizerID         string
-	TokenizerRevision   string
-	ChatTemplateVersion string
-	AdapterID           string
+	ModelID             string `json:"model_id"`
+	ModelRevision       string `json:"model_revision"`
+	TokenizerID         string `json:"tokenizer_id"`
+	TokenizerRevision   string `json:"tokenizer_revision"`
+	ChatTemplateVersion string `json:"chat_template_version"`
+	AdapterID           string `json:"adapter_id"`
 }
 
 type PromptMessage struct {

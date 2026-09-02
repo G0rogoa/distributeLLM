@@ -30,6 +30,12 @@ type result struct {
 	SelectedInstance    string
 	BackendType         string
 	JobID               string
+	Group               string
+	RequestedInput      int
+	RequestedOutput     int
+	PromptTokens        int
+	CompletionTokens    int
+	TotalTokens         int
 }
 type summary struct {
 	Requests    int         `json:"requests"`
@@ -51,6 +57,7 @@ type summary struct {
 }
 type job struct {
 	ID           string `json:"id"`
+	Group        string `json:"group"`
 	Prompt       string `json:"prompt"`
 	InputTokens  int    `json:"input_tokens"`
 	OutputTokens int    `json:"output_tokens"`
@@ -66,7 +73,21 @@ type resultRecord struct {
 	SelectedWorkerID   string  `json:"selected_worker_id,omitempty"`
 	SelectedInstanceID string  `json:"selected_instance_id,omitempty"`
 	BackendType        string  `json:"backend_type,omitempty"`
+	Group              string  `json:"group,omitempty"`
+	RequestedInput     int     `json:"requested_input_tokens,omitempty"`
+	RequestedOutput    int     `json:"requested_output_tokens,omitempty"`
+	PromptTokens       int     `json:"prompt_tokens,omitempty"`
+	CompletionTokens   int     `json:"completion_tokens,omitempty"`
+	TotalTokens        int     `json:"total_tokens,omitempty"`
 	Error              string  `json:"error,omitempty"`
+}
+
+type openAIUsageResponse struct {
+	Usage struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+	} `json:"usage"`
 }
 
 func main() {
@@ -252,10 +273,10 @@ func run(parent context.Context, client *http.Client, target, model string, stre
 	started := time.Now()
 	response, err := client.Do(request)
 	if err != nil {
-		return result{Err: err.Error(), Latency: time.Since(started), JobID: item.ID}
+		return result{Err: err.Error(), Latency: time.Since(started), JobID: item.ID, Group: item.Group, RequestedInput: item.InputTokens, RequestedOutput: item.OutputTokens}
 	}
 	defer response.Body.Close()
-	value := result{Status: response.StatusCode, JobID: item.ID, RequestID: response.Header.Get("X-Request-ID"), SelectedWorker: response.Header.Get("X-DistServe-Worker-ID"), SelectedInstance: response.Header.Get("X-DistServe-Instance-ID"), BackendType: response.Header.Get("X-DistServe-Backend-Type")}
+	value := result{Status: response.StatusCode, JobID: item.ID, Group: item.Group, RequestedInput: item.InputTokens, RequestedOutput: item.OutputTokens, RequestID: response.Header.Get("X-Request-ID"), SelectedWorker: response.Header.Get("X-DistServe-Worker-ID"), SelectedInstance: response.Header.Get("X-DistServe-Instance-ID"), BackendType: response.Header.Get("X-DistServe-Backend-Type")}
 	if stream && response.StatusCode == http.StatusOK {
 		reader := bufio.NewReader(response.Body)
 		for {
@@ -271,9 +292,17 @@ func run(parent context.Context, client *http.Client, target, model string, stre
 			}
 		}
 	} else {
-		_, err = io.Copy(io.Discard, response.Body)
+		raw, readErr := io.ReadAll(io.LimitReader(response.Body, 4<<20))
+		err = readErr
 		if err != nil {
 			value.Err = err.Error()
+		} else if response.StatusCode == http.StatusOK {
+			var decoded openAIUsageResponse
+			if json.Unmarshal(raw, &decoded) == nil {
+				value.PromptTokens = decoded.Usage.PromptTokens
+				value.CompletionTokens = decoded.Usage.CompletionTokens
+				value.TotalTokens = decoded.Usage.TotalTokens
+			}
 		}
 	}
 	value.Latency = time.Since(started)
@@ -301,6 +330,12 @@ func writeResultsJSONL(path string, results []result) error {
 			SelectedWorkerID:   item.SelectedWorker,
 			SelectedInstanceID: item.SelectedInstance,
 			BackendType:        item.BackendType,
+			Group:              item.Group,
+			RequestedInput:     item.RequestedInput,
+			RequestedOutput:    item.RequestedOutput,
+			PromptTokens:       item.PromptTokens,
+			CompletionTokens:   item.CompletionTokens,
+			TotalTokens:        item.TotalTokens,
 			Error:              item.Err,
 		}
 		if err := encoder.Encode(record); err != nil {

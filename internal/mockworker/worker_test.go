@@ -61,7 +61,7 @@ func TestWorkerCacheActualHitAndEvents(t *testing.T) {
 	}
 	server := httptest.NewServer(worker.Handler())
 	defer server.Close()
-	identity := cache.CacheIdentity{ProtocolVersion: cache.PrefixProtocolVersion, ModelID: "mock-llm", ModelRevision: "v1", TokenizerID: "mock", TokenizerRevision: "v1", ChatTemplateVersion: "v1", BlockSizeTokens: 4, CacheFormatVersion: "mock-v1"}
+	identity := cache.CacheIdentity{ProtocolVersion: cache.PrefixProtocolVersion, ModelID: "mock-llm", ModelRevision: "v1", TokenizerID: "mock", TokenizerRevision: "v1", ChatTemplateVersion: "v1", BlockSizeTokens: 4, CacheFormatVersion: "mock-v1", KVLayout: "test-fp16"}
 	blocks, _ := cache.BuildTokenBlocks([]cache.TokenID{1, 2, 3, 4}, 4, 10)
 	chain, _ := cache.BuildPrefixChain(identity, blocks)
 	send := func(predicted int) *http.Response {
@@ -98,7 +98,7 @@ func TestWorkerCancellationDoesNotFillCache(t *testing.T) {
 	events := make(chan cache.CacheEvent, 10)
 	worker := NewWithConfig(Config{Model: "mock-llm", Capacity: 1, PrefillDelay: 200 * time.Millisecond, Seed: 1})
 	_ = worker.EnableCache(cache.WorkerInstanceKey{WorkerID: "w", InstanceID: "i"}, 1024, 4, time.Minute, 0, events)
-	identity := cache.CacheIdentity{ProtocolVersion: cache.PrefixProtocolVersion, ModelID: "mock-llm", ModelRevision: "v1", TokenizerID: "mock", TokenizerRevision: "v1", ChatTemplateVersion: "v1", BlockSizeTokens: 4, CacheFormatVersion: "mock-v1"}
+	identity := cache.CacheIdentity{ProtocolVersion: cache.PrefixProtocolVersion, ModelID: "mock-llm", ModelRevision: "v1", TokenizerID: "mock", TokenizerRevision: "v1", ChatTemplateVersion: "v1", BlockSizeTokens: 4, CacheFormatVersion: "mock-v1", KVLayout: "test-fp16"}
 	blocks, _ := cache.BuildTokenBlocks([]cache.TokenID{1, 2, 3, 4}, 4, 10)
 	chain, _ := cache.BuildPrefixChain(identity, blocks)
 	payload := backend.ChatCompletionRequest{ChatCompletionRequest: api.ChatCompletionRequest{Model: "mock-llm", Messages: []api.Message{{Role: "user", Content: "input"}}, MaxTokens: 1}, CacheHint: &cache.RoutingHint{Identity: identity, PrefixBlocks: chain}}

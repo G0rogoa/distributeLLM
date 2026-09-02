@@ -50,7 +50,7 @@ func TestPrefixCacheColdThenHotEndToEnd(t *testing.T) {
 	}
 	index, _ := cache.NewCacheIndex(100, 100, time.Minute)
 	_ = index.SetWorkerInstance(workerKey.WorkerID, workerKey.InstanceID)
-	identity := cache.CacheIdentity{ProtocolVersion: cache.PrefixProtocolVersion, ModelID: "mock-llm", ModelRevision: "v1", TokenizerID: "mock", TokenizerRevision: "v1", ChatTemplateVersion: "chat-v1", BlockSizeTokens: 4, CacheFormatVersion: "mock-kv-v1"}
+	identity := cache.CacheIdentity{ProtocolVersion: cache.PrefixProtocolVersion, ModelID: "mock-llm", ModelRevision: "v1", TokenizerID: "mock", TokenizerRevision: "v1", ChatTemplateVersion: "chat-v1", BlockSizeTokens: 4, CacheFormatVersion: "mock-kv-v1", KVLayout: "test-fp16"}
 	runtime := &cache.Runtime{Builder: cache.PromptBuilder{Identity: cache.PromptIdentity{ModelID: identity.ModelID, ModelRevision: identity.ModelRevision, TokenizerID: identity.TokenizerID, TokenizerRevision: identity.TokenizerRevision, ChatTemplateVersion: identity.ChatTemplateVersion}, MaxBytes: 1 << 20}, Tokenizer: &cache.DeterministicMockTokenizer{TokenizerID: cache.TokenizerIdentity{ID: "mock", Revision: "v1"}, MaxInputBytes: 1 << 20, MaxTokens: 1000}, Identity: identity, Index: index}
 	strategy := &scheduler.PrefixAware{CacheWeight: 1, LoadWeight: 1, PrefillMSPerToken: 1}
 	gw := gateway.NewDynamic(workers, strategy, "mock-llm", 2*time.Second, 8, false, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -167,7 +167,7 @@ func TestVLLMBackendReceivesPlainOpenAIRequest(t *testing.T) {
 	if err := workers.Heartbeat("real-1", "instance-1", 0, 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	identity := cache.CacheIdentity{ProtocolVersion: cache.PrefixProtocolVersion, ModelID: "mock-llm", ModelRevision: "v1", TokenizerID: "mock", TokenizerRevision: "v1", ChatTemplateVersion: "chat-v1", BlockSizeTokens: 4, CacheFormatVersion: "mock-kv-v1"}
+	identity := cache.CacheIdentity{ProtocolVersion: cache.PrefixProtocolVersion, ModelID: "mock-llm", ModelRevision: "v1", TokenizerID: "mock", TokenizerRevision: "v1", ChatTemplateVersion: "chat-v1", BlockSizeTokens: 4, CacheFormatVersion: "mock-kv-v1", KVLayout: "test-fp16"}
 	runtime := &cache.Runtime{Builder: cache.PromptBuilder{Identity: cache.PromptIdentity{ModelID: identity.ModelID, ModelRevision: identity.ModelRevision, TokenizerID: identity.TokenizerID, TokenizerRevision: identity.TokenizerRevision, ChatTemplateVersion: identity.ChatTemplateVersion}, MaxBytes: 1 << 20}, Tokenizer: &cache.DeterministicMockTokenizer{TokenizerID: cache.TokenizerIdentity{ID: "mock", Revision: "v1"}, MaxInputBytes: 1 << 20, MaxTokens: 1000}, Identity: identity}
 	gw := gateway.NewDynamic(workers, &scheduler.RoundRobin{}, "mock-llm", time.Second, 8, false, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	gw.ConfigureCache(runtime, nil)

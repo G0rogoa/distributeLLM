@@ -65,16 +65,27 @@ type WorkerSnapshot struct {
 	Version                  uint64                 `json:"version"`
 }
 
+type WorkerLifecycleEvent struct {
+	WorkerID      string       `json:"worker_id"`
+	InstanceID    string       `json:"instance_id"`
+	PreviousState WorkerStatus `json:"previous_state"`
+	CurrentState  WorkerStatus `json:"current_state"`
+	Reason        string       `json:"reason"`
+	Time          time.Time    `json:"time"`
+}
+
 type Registry struct {
 	mu                   sync.RWMutex
 	workers              map[string]*Worker
 	suspectThreshold     time.Duration
 	unavailableThreshold time.Duration
 	now                  func() time.Time
+	events               chan WorkerLifecycleEvent
+	droppedEvents        uint64
 }
 
 func New(suspectThreshold, unavailableThreshold time.Duration) *Registry {
-	return &Registry{workers: make(map[string]*Worker), suspectThreshold: suspectThreshold, unavailableThreshold: unavailableThreshold, now: time.Now}
+	return &Registry{workers: make(map[string]*Worker), suspectThreshold: suspectThreshold, unavailableThreshold: unavailableThreshold, now: time.Now, events: make(chan WorkerLifecycleEvent, 1024)}
 }
 
 func (r *Registry) Register(worker Worker) error {
@@ -88,7 +99,6 @@ func (r *Registry) Register(worker Worker) error {
 		worker.Model = worker.Models[0]
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	existing := r.workers[worker.ID]
 	if existing != nil && existing.InstanceID == worker.InstanceID {
 		// Registration is idempotent, but refreshes discoverable metadata.
@@ -100,8 +110,11 @@ func (r *Registry) Register(worker Worker) error {
 		existing.Labels = copyLabels(worker.Labels)
 		existing.Capacity = worker.Capacity
 		existing.Version++
+		r.mu.Unlock()
 		return nil
 	}
+	var event WorkerLifecycleEvent
+	emit := false
 	worker.Models = append([]string(nil), worker.Models...)
 	worker.GPUIndex = copyGPUIndex(worker.GPUIndex)
 	worker.Labels = copyLabels(worker.Labels)
@@ -109,10 +122,16 @@ func (r *Registry) Register(worker Worker) error {
 	worker.LastHeartbeat = r.now()
 	if existing != nil {
 		worker.Version = existing.Version + 1
+		event = WorkerLifecycleEvent{WorkerID: existing.ID, InstanceID: existing.InstanceID, PreviousState: existing.Status, CurrentState: StatusUnavailable, Reason: "instance_replaced", Time: worker.LastHeartbeat}
+		emit = true
 	} else {
 		worker.Version = 1
 	}
 	r.workers[worker.ID] = &worker
+	r.mu.Unlock()
+	if emit {
+		r.emit(event)
+	}
 	return nil
 }
 
@@ -122,17 +141,20 @@ func (r *Registry) Heartbeat(id, instanceID string, running, queued int, remaini
 
 func (r *Registry) HeartbeatWithLoad(id, instanceID string, running, queued int, remaining int64, load *api.WorkerLoadSnapshot) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	worker := r.workers[id]
 	if worker == nil {
+		r.mu.Unlock()
 		return ErrWorkerNotFound
 	}
 	if worker.InstanceID != instanceID {
+		r.mu.Unlock()
 		return ErrStaleInstance
 	}
 	if running < 0 || queued < 0 || remaining < 0 {
+		r.mu.Unlock()
 		return ErrInvalidWorker
 	}
+	previous := worker.Status
 	worker.ReportedRunning = running
 	worker.ReportedQueued = queued
 	worker.EstimatedRemainingTokens = remaining
@@ -146,35 +168,50 @@ func (r *Registry) HeartbeatWithLoad(id, instanceID string, running, queued int,
 		worker.Status = StatusUnavailable
 	}
 	worker.Version++
+	current := worker.Status
+	now := worker.LastHeartbeat
+	r.mu.Unlock()
+	if previous != current {
+		r.emit(WorkerLifecycleEvent{WorkerID: id, InstanceID: instanceID, PreviousState: previous, CurrentState: current, Reason: "heartbeat", Time: now})
+	}
 	return nil
 }
 
 func (r *Registry) Drain(id, instanceID string) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	worker := r.workers[id]
 	if worker == nil {
+		r.mu.Unlock()
 		return ErrWorkerNotFound
 	}
 	if worker.InstanceID != instanceID {
+		r.mu.Unlock()
 		return ErrStaleInstance
 	}
+	previous := worker.Status
 	worker.Status = StatusDraining
 	if worker.ReportedRunning == 0 && worker.ReportedQueued == 0 {
 		worker.Status = StatusUnavailable
 	}
 	worker.Version++
+	current := worker.Status
+	now := r.now()
+	r.mu.Unlock()
+	if previous != current {
+		r.emit(WorkerLifecycleEvent{WorkerID: id, InstanceID: instanceID, PreviousState: previous, CurrentState: current, Reason: "drain", Time: now})
+	}
 	return nil
 }
 
 func (r *Registry) Sweep() {
 	now := r.now()
+	events := []WorkerLifecycleEvent{}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	for _, worker := range r.workers {
 		if worker.Status == StatusDraining || worker.Status == StatusUnavailable {
 			continue
 		}
+		previous := worker.Status
 		age := now.Sub(worker.LastHeartbeat)
 		switch {
 		case age >= r.unavailableThreshold:
@@ -184,6 +221,13 @@ func (r *Registry) Sweep() {
 			worker.Status = StatusSuspect
 			worker.Version++
 		}
+		if previous != worker.Status {
+			events = append(events, WorkerLifecycleEvent{WorkerID: worker.ID, InstanceID: worker.InstanceID, PreviousState: previous, CurrentState: worker.Status, Reason: "heartbeat_timeout", Time: now})
+		}
+	}
+	r.mu.Unlock()
+	for _, event := range events {
+		r.emit(event)
 	}
 }
 
@@ -250,6 +294,24 @@ func (r *Registry) Reserve(id, instanceID string) (func(), error) {
 }
 
 func (r *Registry) SetNowForTest(now func() time.Time) { r.now = now }
+
+func (r *Registry) Events() <-chan WorkerLifecycleEvent { return r.events }
+
+func (r *Registry) DroppedEvents() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.droppedEvents
+}
+
+func (r *Registry) emit(event WorkerLifecycleEvent) {
+	select {
+	case r.events <- event:
+	default:
+		r.mu.Lock()
+		r.droppedEvents++
+		r.mu.Unlock()
+	}
+}
 
 func (r *Registry) CurrentInstance(id string) (string, bool) {
 	r.mu.RLock()

@@ -74,6 +74,37 @@ func TestLeastLoadedAndTieBreak(t *testing.T) {
 	}
 }
 
+func TestExpectedCompletionTimeUsesCacheAndLoad(t *testing.T) {
+	s := &ExpectedCompletionTime{PrefillMSPerToken: 1, DecodeMSPerToken: 1, RunningMS: 20}
+	a, b := worker("a", 1, 0), worker("b", 0, 0)
+	features := &cache.RequestFeatures{TotalInputTokens: 120, Matches: map[cache.WorkerInstanceKey]cache.PrefixMatch{
+		{WorkerID: a.ID, InstanceID: a.InstanceID}: {MatchedTokens: 100, MatchedBlocks: 5, Evidence: cache.EvidenceShadowEstimated},
+	}}
+	got, err := s.Select(context.Background(), RequestMeta{Model: "mock-llm", InputTokens: 120, MaxOutputTokens: 10, Cache: features}, []registry.WorkerSnapshot{a, b})
+	if err != nil || got.WorkerID != "a" || got.ScoreDetails.MatchedTokens != 100 {
+		t.Fatalf("got=%+v err=%v", got, err)
+	}
+	a.ReportedRunning = 8
+	got, err = s.Select(context.Background(), RequestMeta{Model: "mock-llm", InputTokens: 120, MaxOutputTokens: 10, Cache: features}, []registry.WorkerSnapshot{a, b})
+	if err != nil || got.WorkerID != "b" {
+		t.Fatalf("load should win: got=%+v err=%v", got, err)
+	}
+}
+
+func TestExpectedCompletionTimeUsesVLLMOptionalLoadWhenPresent(t *testing.T) {
+	s := &ExpectedCompletionTime{PrefillMSPerToken: 1, DecodeMSPerToken: 1, QueueMS: 100}
+	a, b := worker("a", 0, 0), worker("b", 0, 0)
+	a.Load.WaitingRequests.Valid = true
+	a.Load.WaitingRequests.Value = 2
+	got, err := s.Select(context.Background(), RequestMeta{Model: "mock-llm", InputTokens: 10, MaxOutputTokens: 1}, []registry.WorkerSnapshot{a, b})
+	if err != nil || got.WorkerID != "b" {
+		t.Fatalf("got=%+v err=%v", got, err)
+	}
+	if len(got.Candidates) != 2 {
+		t.Fatalf("candidates=%+v", got.Candidates)
+	}
+}
+
 func TestNoEligibleWorker(t *testing.T) {
 	s := &RoundRobin{}
 	unavailable := worker("a", 0, 0)

@@ -171,3 +171,57 @@ func TestReservationLifecycleAndInstanceReplacement(t *testing.T) {
 		t.Fatalf("replacement reservations=%d", got)
 	}
 }
+
+func TestLifecycleEvents(t *testing.T) {
+	base := time.Unix(100, 0)
+	now := base
+	r := New(5*time.Second, 10*time.Second)
+	r.SetNowForTest(func() time.Time { return now })
+	if err := r.Register(validWorker("old")); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Heartbeat("worker-1", "old", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	expectEvent(t, r.Events(), StatusStarting, StatusHealthy, "heartbeat", "old")
+	if err := r.Register(validWorker("new")); err != nil {
+		t.Fatal(err)
+	}
+	expectEvent(t, r.Events(), StatusHealthy, StatusUnavailable, "instance_replaced", "old")
+	if err := r.Heartbeat("worker-1", "new", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	expectEvent(t, r.Events(), StatusStarting, StatusHealthy, "heartbeat", "new")
+	if err := r.Drain("worker-1", "new"); err != nil {
+		t.Fatal(err)
+	}
+	expectEvent(t, r.Events(), StatusHealthy, StatusUnavailable, "drain", "new")
+}
+
+func TestSweepLifecycleEvent(t *testing.T) {
+	base := time.Unix(200, 0)
+	now := base
+	r := New(5*time.Second, 10*time.Second)
+	r.SetNowForTest(func() time.Time { return now })
+	if err := r.Register(validWorker("instance")); err != nil {
+		t.Fatal(err)
+	}
+	now = base.Add(6 * time.Second)
+	r.Sweep()
+	expectEvent(t, r.Events(), StatusStarting, StatusSuspect, "heartbeat_timeout", "instance")
+	now = base.Add(11 * time.Second)
+	r.Sweep()
+	expectEvent(t, r.Events(), StatusSuspect, StatusUnavailable, "heartbeat_timeout", "instance")
+}
+
+func expectEvent(t *testing.T, events <-chan WorkerLifecycleEvent, previous, current WorkerStatus, reason, instance string) {
+	t.Helper()
+	select {
+	case event := <-events:
+		if event.PreviousState != previous || event.CurrentState != current || event.Reason != reason || event.InstanceID != instance {
+			t.Fatalf("event=%+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing lifecycle event")
+	}
+}

@@ -51,6 +51,17 @@ go run ./cmd/workeragent -worker-id=worker-gpu1 -gpu-index=1 -model=example-mode
 
 Controller 会向 `backend_type: vllm` 的 Worker 转发普通 OpenAI-compatible JSON，并保留 SSE streaming。响应头会带上本次选择的 Worker，`/internal/debug/decisions` 会保留最近的候选分数，便于静态多实例实验复盘。它不会启动 vLLM、选择 GPU、kill 进程，也不会声称精确知道真实 KV block 驻留情况。更多说明见 `docs/real-vllm-integration.md`、`docs/real-cache-observability.md` 和 `docs/stage3-experiment-plan.md`。
 
+真实 cache-aware 实验需要额外启动 tokenizer sidecar，并用 `-tokenizer-mode=remote` 和 `-scheduler=ect`：
+
+```bash
+PYTHON="/opt/anaconda3/bin/conda run -n zsq python" \
+TOKENIZER_PATH=/path/to/model \
+MODEL_ID=example-model MODEL_REVISION=local-v1 \
+TOKENIZER_ID=example-tokenizer TOKENIZER_REVISION=local-v1 \
+CHAT_TEMPLATE_VERSION=chat-v1 \
+scripts/run-tokenizer-service.sh
+```
+
 ## 运行当前 Mock 控制面
 
 需要 Go 1.23 或更新版本：
@@ -69,7 +80,7 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"mock-llm","messages":[{"role":"user","content":"hello"}],"max_tokens":4,"stream":true}'
 ```
 
-默认调度器是 prefix-aware；可用 `-scheduler=round-robin` 或 `-scheduler=least-loaded` 跑 baseline。指标在 `/metrics`；内部检查端点见 `docs/api.md`。
+默认调度器是 prefix-aware；可用 `-scheduler=round-robin`、`-scheduler=least-loaded` 或 `-scheduler=ect` 跑 baseline/对照。指标在 `/metrics`；内部检查端点见 `docs/api.md`。
 
 如果安装了 Docker，可以运行：
 

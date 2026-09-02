@@ -17,6 +17,7 @@ type Metrics struct {
 	AdmissionRejections, SchedulerDecisions, SchedulerFailures, Reservations atomic.Int64
 	CachePredictedTokens, CacheActualTokens, CachePredictionMisses           atomic.Int64
 	ShadowAffinityMatches                                                    atomic.Int64
+	TokenizerFallbacks                                                       atomic.Int64
 	mu                                                                       sync.Mutex
 	requestDurationSum, ttftSum                                              float64
 	requestDurationCount, ttftCount                                          int64
@@ -45,7 +46,7 @@ func (m *Metrics) ObserveTTFT(seconds float64) {
 	m.mu.Unlock()
 }
 
-func (m *Metrics) Handler(snapshots func() []registry.WorkerSnapshot, cacheStats func() cache.CacheStats) http.HandlerFunc {
+func (m *Metrics) Handler(snapshots func() []registry.WorkerSnapshot, cacheStats func() cache.CacheStats, affinityStats func() cache.AffinityStats) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		m.mu.Lock()
@@ -69,6 +70,7 @@ func (m *Metrics) Handler(snapshots func() []registry.WorkerSnapshot, cacheStats
 			"distserve_cache_actual_hit_tokens_total":    float64(m.CacheActualTokens.Load()),
 			"distserve_cache_prediction_misses_total":    float64(m.CachePredictionMisses.Load()),
 			"distserve_shadow_affinity_matches_total":    float64(m.ShadowAffinityMatches.Load()),
+			"distserve_tokenizer_fallbacks_total":        float64(m.TokenizerFallbacks.Load()),
 		}
 		names := make([]string, 0, len(values))
 		for name := range values {
@@ -92,6 +94,15 @@ func (m *Metrics) Handler(snapshots func() []registry.WorkerSnapshot, cacheStats
 			fmt.Fprintf(w, "distserve_cache_entries_expired_total %d\n", stats.ExpiredEntries)
 			fmt.Fprintf(w, "distserve_cache_resets_total %d\n", stats.Resets)
 		}
+		if affinityStats != nil {
+			stats := affinityStats()
+			fmt.Fprintf(w, "distserve_shadow_affinity_entries %d\n", stats.Entries)
+			fmt.Fprintf(w, "distserve_shadow_affinity_hits_total %d\n", stats.Hits)
+			fmt.Fprintf(w, "distserve_shadow_affinity_misses_total %d\n", stats.Misses)
+			fmt.Fprintf(w, "distserve_shadow_affinity_expired_total %d\n", stats.Expired)
+			fmt.Fprintf(w, "distserve_shadow_affinity_evicted_total %d\n", stats.Evicted)
+			fmt.Fprintf(w, "distserve_shadow_affinity_cleared_on_instance_change_total %d\n", stats.ClearedOnInstanceChange)
+		}
 		states := map[registry.WorkerStatus]int{}
 		if snapshots != nil {
 			for _, worker := range snapshots() {
@@ -103,6 +114,21 @@ func (m *Metrics) Handler(snapshots func() []registry.WorkerSnapshot, cacheStats
 				fmt.Fprintf(w, "distserve_worker_heartbeat_age_seconds{worker_id=%q} %g\n", worker.ID, age)
 				fmt.Fprintf(w, "distserve_worker_reported_running{worker_id=%q} %d\n", worker.ID, worker.ReportedRunning)
 				fmt.Fprintf(w, "distserve_worker_reported_queued{worker_id=%q} %d\n", worker.ID, worker.ReportedQueued)
+				if worker.Load.RunningRequests.Valid {
+					fmt.Fprintf(w, "distserve_worker_vllm_running_requests{worker_id=%q} %d\n", worker.ID, worker.Load.RunningRequests.Value)
+				}
+				if worker.Load.WaitingRequests.Valid {
+					fmt.Fprintf(w, "distserve_worker_vllm_waiting_requests{worker_id=%q} %d\n", worker.ID, worker.Load.WaitingRequests.Value)
+				}
+				if worker.Load.GPUKVCacheUsageRatio.Valid {
+					fmt.Fprintf(w, "distserve_worker_vllm_gpu_kv_cache_usage_ratio{worker_id=%q} %g\n", worker.ID, worker.Load.GPUKVCacheUsageRatio.Value)
+				}
+				if worker.Load.PrefixCacheHitsTotal.Valid {
+					fmt.Fprintf(w, "distserve_worker_vllm_prefix_cache_hits_total{worker_id=%q} %d\n", worker.ID, worker.Load.PrefixCacheHitsTotal.Value)
+				}
+				if worker.Load.PrefixCacheMissesTotal.Valid {
+					fmt.Fprintf(w, "distserve_worker_vllm_prefix_cache_misses_total{worker_id=%q} %d\n", worker.ID, worker.Load.PrefixCacheMissesTotal.Value)
+				}
 			}
 		}
 		for _, state := range []registry.WorkerStatus{registry.StatusStarting, registry.StatusHealthy, registry.StatusSuspect, registry.StatusDraining, registry.StatusUnavailable} {

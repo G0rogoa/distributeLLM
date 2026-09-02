@@ -109,6 +109,12 @@ type PrefixAware struct {
 	next                                                                                                                                                                 uint64
 }
 
+type ExpectedCompletionTime struct {
+	PrefillMSPerToken, DecodeMSPerToken, RunningMS, QueueMS, ReservationMS, RemainingTokenMS, ShadowDiscount, DegradedPenalty float64
+	mu                                                                                                                        sync.Mutex
+	next                                                                                                                      uint64
+}
+
 func (s *PrefixAware) Name() string { return "prefix-aware" }
 func (s *PrefixAware) Select(ctx context.Context, request RequestMeta, workers []registry.WorkerSnapshot) (Decision, error) {
 	if err := ctx.Err(); err != nil {
@@ -163,6 +169,79 @@ func (s *PrefixAware) Select(ctx context.Context, request RequestMeta, workers [
 	return chosen, nil
 }
 
+func (s *ExpectedCompletionTime) Name() string { return "ect" }
+func (s *ExpectedCompletionTime) Select(ctx context.Context, request RequestMeta, workers []registry.WorkerSnapshot) (Decision, error) {
+	if err := ctx.Err(); err != nil {
+		return Decision{}, err
+	}
+	candidates := eligible(request.Model, workers)
+	if len(candidates) == 0 {
+		return Decision{}, ErrNoWorker
+	}
+	bestScore := 0.0
+	best := make([]Decision, 0)
+	summaries := make([]CandidateScore, 0, len(candidates))
+	for _, worker := range candidates {
+		key := cache.WorkerInstanceKey{WorkerID: worker.ID, InstanceID: worker.InstanceID}
+		match := cache.PrefixMatch{}
+		if request.Cache != nil {
+			match = request.Cache.Matches[key]
+		}
+		running := worker.ReportedRunning
+		if worker.Load.RunningRequests.Valid {
+			running = int(worker.Load.RunningRequests.Value)
+		}
+		queued := worker.ReportedQueued
+		if worker.Load.WaitingRequests.Valid {
+			queued = int(worker.Load.WaitingRequests.Value)
+		}
+		inputTokens := request.InputTokens
+		if request.Cache != nil && request.Cache.TotalInputTokens > 0 {
+			inputTokens = request.Cache.TotalInputTokens
+		}
+		uncachedTokens := inputTokens - match.MatchedTokens
+		if uncachedTokens < 0 {
+			uncachedTokens = 0
+		}
+		details := ScoreBreakdown{MatchedTokens: match.MatchedTokens}
+		details.CacheBenefit = float64(match.MatchedTokens) * s.prefillMS()
+		details.RunningPenalty = float64(running) * defaultFloat(s.RunningMS, 20)
+		details.QueuePenalty = float64(queued) * defaultFloat(s.QueueMS, 40)
+		details.ReservationPenalty = float64(worker.LocalReservations) * defaultFloat(s.ReservationMS, 20)
+		details.RemainingTokensPenalty = float64(worker.EstimatedRemainingTokens) * defaultFloat(s.RemainingTokenMS, 0.01)
+		if match.CacheViewState == cache.CacheViewDegraded || match.CacheViewState == cache.CacheViewStale {
+			details.StalenessPenalty = defaultFloat(s.DegradedPenalty, 100)
+		}
+		if match.Evidence == cache.EvidenceShadowEstimated {
+			details.FillAffinityBonus = details.CacheBenefit * defaultFloat(s.ShadowDiscount, 0.5)
+		}
+		ect := float64(uncachedTokens)*s.prefillMS() + float64(request.MaxOutputTokens)*defaultFloat(s.DecodeMSPerToken, 1) + details.RunningPenalty + details.QueuePenalty + details.ReservationPenalty + details.RemainingTokensPenalty + details.StalenessPenalty - details.FillAffinityBonus
+		if ect < 0 {
+			ect = 0
+		}
+		details.FinalScore = -ect
+		reason := fmt.Sprintf("selected %s: ect_ms=%.3f, uncached_tokens=%d, matched_tokens=%d, running=%d, queued=%d, reservations=%d", worker.ID, ect, uncachedTokens, match.MatchedTokens, running, queued, worker.LocalReservations)
+		candidate := decision(s.Name(), worker, -ect, reason)
+		candidate.CacheMatch = match
+		candidate.ScoreDetails = details
+		summaries = append(summaries, candidateSummary(worker, -ect, reason, match, details))
+		if len(best) == 0 || -ect > bestScore {
+			best = []Decision{candidate}
+			bestScore = -ect
+		} else if -ect == bestScore {
+			best = append(best, candidate)
+		}
+	}
+	s.mu.Lock()
+	chosen := best[int(s.next%uint64(len(best)))]
+	s.next++
+	s.mu.Unlock()
+	chosen.Candidates = summaries
+	return chosen, nil
+}
+
+func (s *ExpectedCompletionTime) prefillMS() float64 { return defaultFloat(s.PrefillMSPerToken, 0.5) }
+
 func (s *LeastLoaded) Name() string { return "least-loaded" }
 
 func (s *LeastLoaded) Select(ctx context.Context, request RequestMeta, workers []registry.WorkerSnapshot) (Decision, error) {
@@ -195,6 +274,13 @@ func (s *LeastLoaded) Select(ctx context.Context, request RequestMeta, workers [
 	result := decision(s.Name(), worker, bestScore, reason)
 	result.Candidates = summaries
 	return result, nil
+}
+
+func defaultFloat(value, fallback float64) float64 {
+	if value == 0 {
+		return fallback
+	}
+	return value
 }
 
 func eligible(model string, workers []registry.WorkerSnapshot) []registry.WorkerSnapshot {

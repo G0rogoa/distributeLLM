@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net/http"
+	"time"
 	"unicode"
 )
 
@@ -32,6 +34,7 @@ var (
 	ErrTokenizerInputTooLarge = errors.New("tokenizer input exceeds size limit")
 	ErrTokenizerDisabled      = errors.New("tokenizer disabled")
 	ErrTokenizerUnavailable   = errors.New("tokenizer unavailable")
+	ErrTokenizerIdentity      = errors.New("tokenizer identity mismatch")
 )
 
 type DisabledTokenizer struct{}
@@ -44,17 +47,16 @@ func (DisabledTokenizer) Encode(context.Context, string) ([]TokenID, error) {
 }
 
 type RemoteTokenizer struct {
-	TokenizerID TokenizerIdentity
-	URL         string
+	TokenizerID      TokenizerIdentity
+	URL              string
+	ExpectedIdentity PromptIdentity
+	Client           *http.Client
+	Timeout          time.Duration
+	MaxResponseBytes int64
+	MaxTokens        int
 }
 
 func (t RemoteTokenizer) Identity() TokenizerIdentity { return t.TokenizerID }
-func (t RemoteTokenizer) Encode(context.Context, string) ([]TokenID, error) {
-	if t.URL == "" {
-		return nil, ErrTokenizerUnavailable
-	}
-	return nil, ErrTokenizerUnavailable
-}
 
 type DeterministicMockTokenizer struct {
 	TokenizerID   TokenizerIdentity

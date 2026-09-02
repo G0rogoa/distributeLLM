@@ -16,4 +16,6 @@
 
 `GET /internal/debug/decisions` 返回最近的调度决策环形缓冲区。每条记录包含 request ID、策略名、最终选择的 worker/instance、score/reason，以及所有 eligible candidates 的低基数字段和 score breakdown。它不会记录 prompt、backend address 或 Authorization header。
 
+Controller 支持 `-tokenizer-mode=mock|disabled|remote`。Remote mode 需要 `-tokenizer-url` 和正数 `-tokenizer-timeout`，并且必须显式配置完整 cache identity：`-model-revision`、`-tokenizer-id`、`-tokenizer-revision`、`-chat-template-version`、`-cache-format-version`、`-kv-layout` 和 `-cache-block-size`。Remote tokenizer 失败时请求仍会转发到 backend，但 lifecycle 和 metrics 会记录 `tokenizer_fallback`。
+
 Gateway 错误使用类似 OpenAI 的 `{ "error": { "message", "type", "code" } }` envelope。重要状态码包括：400 表示输入/model 无效，429 表示 Controller admission rejection，503 表示无 eligible worker 或 Worker queue full，504 表示 deadline，502 表示 worker transport failure。

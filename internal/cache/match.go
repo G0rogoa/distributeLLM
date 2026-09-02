@@ -29,11 +29,12 @@ const (
 )
 
 type RequestFeatures struct {
-	Identity         CacheIdentity
-	PrefixBlocks     []PrefixBlock
-	TotalInputTokens int
-	Matches          map[WorkerInstanceKey]PrefixMatch
-	FillAffinity     map[WorkerInstanceKey]bool
+	Identity          CacheIdentity
+	PrefixBlocks      []PrefixBlock
+	TotalInputTokens  int
+	Matches           map[WorkerInstanceKey]PrefixMatch
+	FillAffinity      map[WorkerInstanceKey]bool
+	TokenizerFallback bool
 }
 
 type Runtime struct {
@@ -50,8 +51,8 @@ func (runtime *Runtime) Prepare(ctx context.Context, messages []PromptMessage) (
 	}
 	tokens, err := runtime.Tokenizer.Encode(ctx, built.Text)
 	if err != nil {
-		if errors.Is(err, ErrTokenizerDisabled) || errors.Is(err, ErrTokenizerUnavailable) {
-			return &RequestFeatures{Identity: runtime.Identity}, nil
+		if errors.Is(err, ErrTokenizerDisabled) || errors.Is(err, ErrTokenizerUnavailable) || errors.Is(err, ErrTokenizerIdentity) || errors.Is(err, context.DeadlineExceeded) {
+			return &RequestFeatures{Identity: runtime.Identity, TokenizerFallback: true}, nil
 		}
 		return nil, err
 	}

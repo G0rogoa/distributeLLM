@@ -24,6 +24,7 @@ type Request struct {
 	ResponseStarted      bool      `json:"response_started"`
 	FinalStatus          string    `json:"final_status"`
 	CacheFullBlocks      int       `json:"cache_full_blocks"`
+	TokenizerFallback    bool      `json:"tokenizer_fallback"`
 	CachePredictedBlocks int       `json:"cache_predicted_blocks"`
 	CachePredictedTokens int       `json:"cache_predicted_tokens"`
 	CacheEvidence        string    `json:"cache_evidence,omitempty"`

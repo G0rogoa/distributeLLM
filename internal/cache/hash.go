@@ -24,6 +24,7 @@ type CacheIdentity struct {
 	AdapterID           string `json:"adapter_id,omitempty"`
 	BlockSizeTokens     int    `json:"block_size_tokens"`
 	CacheFormatVersion  string `json:"cache_format_version"`
+	KVLayout            string `json:"kv_layout"`
 }
 
 type PrefixBlock struct {
@@ -42,7 +43,7 @@ type RoutingHint struct {
 }
 
 func (identity CacheIdentity) Validate() error {
-	if identity.ProtocolVersion == "" || identity.ModelID == "" || identity.ModelRevision == "" || identity.TokenizerID == "" || identity.TokenizerRevision == "" || identity.ChatTemplateVersion == "" || identity.BlockSizeTokens < 1 || identity.CacheFormatVersion == "" {
+	if identity.ProtocolVersion == "" || identity.ModelID == "" || identity.ModelRevision == "" || identity.TokenizerID == "" || identity.TokenizerRevision == "" || identity.ChatTemplateVersion == "" || identity.BlockSizeTokens < 1 || identity.CacheFormatVersion == "" || identity.KVLayout == "" {
 		return ErrInvalidIdentity
 	}
 	return nil
@@ -107,6 +108,7 @@ func encodeIdentity(identity CacheIdentity) ([]byte, error) {
 	writeString(&encoded, identity.AdapterID)
 	writeUint32(&encoded, uint32(identity.BlockSizeTokens))
 	writeString(&encoded, identity.CacheFormatVersion)
+	writeString(&encoded, identity.KVLayout)
 	return encoded.Bytes(), nil
 }
 
