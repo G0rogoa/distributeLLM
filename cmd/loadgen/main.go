@@ -22,20 +22,24 @@ import (
 )
 
 type result struct {
-	Status              int
-	Latency, TTFT, TPOT time.Duration
-	Err                 string
-	RequestID           string
-	SelectedWorker      string
-	SelectedInstance    string
-	BackendType         string
-	JobID               string
-	Group               string
-	RequestedInput      int
-	RequestedOutput     int
-	PromptTokens        int
-	CompletionTokens    int
-	TotalTokens         int
+	Status                  int
+	Latency, TTFT, TPOT     time.Duration
+	Err                     string
+	RequestID               string
+	SelectedWorker          string
+	SelectedInstance        string
+	BackendType             string
+	JobID                   string
+	Group                   string
+	RequestedInput          int
+	RequestedOutput         int
+	PromptTokens            int
+	CompletionTokens        int
+	TotalTokens             int
+	UsageSource             string
+	UsageValid              bool
+	PrefillObservationValid bool
+	DecodeObservationValid  bool
 }
 type summary struct {
 	Requests    int         `json:"requests"`
@@ -64,30 +68,30 @@ type job struct {
 }
 
 type resultRecord struct {
-	JobID              string  `json:"job_id,omitempty"`
-	RequestID          string  `json:"request_id,omitempty"`
-	Status             int     `json:"status"`
-	LatencyMS          float64 `json:"latency_ms"`
-	TTFTMS             float64 `json:"ttft_ms,omitempty"`
-	TPOTMS             float64 `json:"tpot_ms,omitempty"`
-	SelectedWorkerID   string  `json:"selected_worker_id,omitempty"`
-	SelectedInstanceID string  `json:"selected_instance_id,omitempty"`
-	BackendType        string  `json:"backend_type,omitempty"`
-	Group              string  `json:"group,omitempty"`
-	RequestedInput     int     `json:"requested_input_tokens,omitempty"`
-	RequestedOutput    int     `json:"requested_output_tokens,omitempty"`
-	PromptTokens       int     `json:"prompt_tokens,omitempty"`
-	CompletionTokens   int     `json:"completion_tokens,omitempty"`
-	TotalTokens        int     `json:"total_tokens,omitempty"`
-	Error              string  `json:"error,omitempty"`
+	JobID                   string  `json:"job_id,omitempty"`
+	RequestID               string  `json:"request_id,omitempty"`
+	Status                  int     `json:"status"`
+	LatencyMS               float64 `json:"latency_ms"`
+	TTFTMS                  float64 `json:"ttft_ms,omitempty"`
+	TPOTMS                  float64 `json:"tpot_ms,omitempty"`
+	SelectedWorkerID        string  `json:"selected_worker_id,omitempty"`
+	SelectedInstanceID      string  `json:"selected_instance_id,omitempty"`
+	BackendType             string  `json:"backend_type,omitempty"`
+	Group                   string  `json:"group,omitempty"`
+	RequestedInput          int     `json:"requested_input_tokens,omitempty"`
+	RequestedOutput         int     `json:"requested_output_tokens,omitempty"`
+	PromptTokens            int     `json:"prompt_tokens,omitempty"`
+	CompletionTokens        int     `json:"completion_tokens,omitempty"`
+	TotalTokens             int     `json:"total_tokens,omitempty"`
+	UsageSource             string  `json:"usage_source"`
+	UsageValid              bool    `json:"usage_valid"`
+	PrefillObservationValid bool    `json:"prefill_observation_valid"`
+	DecodeObservationValid  bool    `json:"decode_observation_valid"`
+	Error                   string  `json:"error,omitempty"`
 }
 
 type openAIUsageResponse struct {
-	Usage struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-		TotalTokens      int `json:"total_tokens"`
-	} `json:"usage"`
+	Usage *api.Usage `json:"usage"`
 }
 
 func main() {
@@ -264,6 +268,9 @@ func run(parent context.Context, client *http.Client, target, model string, stre
 		prompt = strings.Repeat("word ", item.InputTokens)
 	}
 	input := api.ChatCompletionRequest{Model: model, Messages: []api.Message{{Role: "user", Content: prompt}}, MaxTokens: item.OutputTokens, Stream: stream}
+	if stream {
+		input.StreamOptions = &api.StreamOptions{IncludeUsage: true}
+	}
 	body, _ := json.Marshal(input)
 	request, _ := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(target, "/")+"/v1/chat/completions", bytes.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
@@ -276,13 +283,20 @@ func run(parent context.Context, client *http.Client, target, model string, stre
 		return result{Err: err.Error(), Latency: time.Since(started), JobID: item.ID, Group: item.Group, RequestedInput: item.InputTokens, RequestedOutput: item.OutputTokens}
 	}
 	defer response.Body.Close()
-	value := result{Status: response.StatusCode, JobID: item.ID, Group: item.Group, RequestedInput: item.InputTokens, RequestedOutput: item.OutputTokens, RequestID: response.Header.Get("X-Request-ID"), SelectedWorker: response.Header.Get("X-DistServe-Worker-ID"), SelectedInstance: response.Header.Get("X-DistServe-Instance-ID"), BackendType: response.Header.Get("X-DistServe-Backend-Type")}
+	value := result{Status: response.StatusCode, JobID: item.ID, Group: item.Group, RequestedInput: item.InputTokens, RequestedOutput: item.OutputTokens, RequestID: response.Header.Get("X-Request-ID"), SelectedWorker: response.Header.Get("X-DistServe-Worker-ID"), SelectedInstance: response.Header.Get("X-DistServe-Instance-ID"), BackendType: response.Header.Get("X-DistServe-Backend-Type"), UsageSource: "unknown"}
 	if stream && response.StatusCode == http.StatusOK {
 		reader := bufio.NewReader(response.Body)
 		for {
 			line, readErr := reader.ReadString('\n')
 			if value.TTFT == 0 && strings.HasPrefix(line, "data:") && !strings.Contains(line, "[DONE]") {
 				value.TTFT = time.Since(started)
+			}
+			if usage, ok := parseSSEUsage(line); ok {
+				value.PromptTokens = usage.PromptTokens
+				value.CompletionTokens = usage.CompletionTokens
+				value.TotalTokens = usage.TotalTokens
+				value.UsageSource = "vllm_response"
+				value.UsageValid = true
 			}
 			if readErr != nil {
 				if readErr != io.EOF {
@@ -298,18 +312,47 @@ func run(parent context.Context, client *http.Client, target, model string, stre
 			value.Err = err.Error()
 		} else if response.StatusCode == http.StatusOK {
 			var decoded openAIUsageResponse
-			if json.Unmarshal(raw, &decoded) == nil {
+			if json.Unmarshal(raw, &decoded) == nil && decoded.Usage != nil && validUsage(*decoded.Usage) {
 				value.PromptTokens = decoded.Usage.PromptTokens
 				value.CompletionTokens = decoded.Usage.CompletionTokens
 				value.TotalTokens = decoded.Usage.TotalTokens
+				value.UsageSource = "vllm_response"
+				value.UsageValid = true
 			}
 		}
 	}
 	value.Latency = time.Since(started)
-	if item.OutputTokens > 1 && value.TTFT > 0 {
+	if value.UsageValid && value.CompletionTokens > 1 && value.TTFT > 0 {
+		value.TPOT = (value.Latency - value.TTFT) / time.Duration(value.CompletionTokens-1)
+		value.DecodeObservationValid = true
+	} else if !value.UsageValid && item.OutputTokens > 1 && value.TTFT > 0 {
 		value.TPOT = (value.Latency - value.TTFT) / time.Duration(item.OutputTokens-1)
 	}
+	value.PrefillObservationValid = value.TTFT > 0 && value.Status == http.StatusOK && value.Err == ""
 	return value
+}
+
+func parseSSEUsage(line string) (api.Usage, bool) {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "data:") {
+		return api.Usage{}, false
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	if payload == "" || payload == "[DONE]" {
+		return api.Usage{}, false
+	}
+	var decoded openAIUsageResponse
+	if json.Unmarshal([]byte(payload), &decoded) != nil || decoded.Usage == nil {
+		return api.Usage{}, false
+	}
+	if !validUsage(*decoded.Usage) {
+		return api.Usage{}, false
+	}
+	return *decoded.Usage, true
+}
+
+func validUsage(usage api.Usage) bool {
+	return usage.PromptTokens >= 0 && usage.CompletionTokens >= 0 && usage.TotalTokens == usage.PromptTokens+usage.CompletionTokens
 }
 
 func writeResultsJSONL(path string, results []result) error {
@@ -321,22 +364,26 @@ func writeResultsJSONL(path string, results []result) error {
 	encoder := json.NewEncoder(file)
 	for _, item := range results {
 		record := resultRecord{
-			JobID:              item.JobID,
-			RequestID:          item.RequestID,
-			Status:             item.Status,
-			LatencyMS:          float64(item.Latency) / float64(time.Millisecond),
-			TTFTMS:             float64(item.TTFT) / float64(time.Millisecond),
-			TPOTMS:             float64(item.TPOT) / float64(time.Millisecond),
-			SelectedWorkerID:   item.SelectedWorker,
-			SelectedInstanceID: item.SelectedInstance,
-			BackendType:        item.BackendType,
-			Group:              item.Group,
-			RequestedInput:     item.RequestedInput,
-			RequestedOutput:    item.RequestedOutput,
-			PromptTokens:       item.PromptTokens,
-			CompletionTokens:   item.CompletionTokens,
-			TotalTokens:        item.TotalTokens,
-			Error:              item.Err,
+			JobID:                   item.JobID,
+			RequestID:               item.RequestID,
+			Status:                  item.Status,
+			LatencyMS:               float64(item.Latency) / float64(time.Millisecond),
+			TTFTMS:                  float64(item.TTFT) / float64(time.Millisecond),
+			TPOTMS:                  float64(item.TPOT) / float64(time.Millisecond),
+			SelectedWorkerID:        item.SelectedWorker,
+			SelectedInstanceID:      item.SelectedInstance,
+			BackendType:             item.BackendType,
+			Group:                   item.Group,
+			RequestedInput:          item.RequestedInput,
+			RequestedOutput:         item.RequestedOutput,
+			PromptTokens:            item.PromptTokens,
+			CompletionTokens:        item.CompletionTokens,
+			TotalTokens:             item.TotalTokens,
+			UsageSource:             item.UsageSource,
+			UsageValid:              item.UsageValid,
+			PrefillObservationValid: item.PrefillObservationValid,
+			DecodeObservationValid:  item.DecodeObservationValid,
+			Error:                   item.Err,
 		}
 		if err := encoder.Encode(record); err != nil {
 			return fmt.Errorf("write output: %w", err)

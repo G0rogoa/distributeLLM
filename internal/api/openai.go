@@ -6,11 +6,16 @@ type Message struct {
 }
 
 type ChatCompletionRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	MaxTokens   int       `json:"max_tokens"`
-	Temperature float64   `json:"temperature,omitempty"`
-	Stream      bool      `json:"stream"`
+	Model         string         `json:"model"`
+	Messages      []Message      `json:"messages"`
+	MaxTokens     int            `json:"max_tokens"`
+	Temperature   float64        `json:"temperature,omitempty"`
+	Stream        bool           `json:"stream"`
+	StreamOptions *StreamOptions `json:"stream_options,omitempty"`
+}
+
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage,omitempty"`
 }
 
 type ChatCompletionResponse struct {
@@ -18,6 +23,7 @@ type ChatCompletionResponse struct {
 	Object  string   `json:"object"`
 	Model   string   `json:"model"`
 	Choices []Choice `json:"choices"`
+	Usage   *Usage   `json:"usage,omitempty"`
 }
 
 type Choice struct {
@@ -29,6 +35,12 @@ type Choice struct {
 
 type ErrorResponse struct {
 	Error APIError `json:"error"`
+}
+
+type Usage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
 type APIError struct {

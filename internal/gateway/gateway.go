@@ -20,6 +20,7 @@ import (
 	"distserve/internal/api"
 	"distserve/internal/backend"
 	"distserve/internal/cache"
+	"distserve/internal/costmodel"
 	"distserve/internal/lifecycle"
 	"distserve/internal/registry"
 	"distserve/internal/scheduler"
@@ -42,6 +43,7 @@ type Gateway struct {
 	cacheRuntime     *cache.Runtime
 	fillReservations *cache.FillReservations
 	shadowAffinity   *cache.AffinityIndex
+	onlineCost       *costmodel.OnlineStore
 	backend          backend.Backend
 	decisions        *decisionStore
 }
@@ -53,6 +55,10 @@ func (g *Gateway) ConfigureCache(runtime *cache.Runtime, fills *cache.FillReserv
 
 func (g *Gateway) ConfigureShadowAffinity(index *cache.AffinityIndex) {
 	g.shadowAffinity = index
+}
+
+func (g *Gateway) ConfigureOnlineCost(store *costmodel.OnlineStore) {
+	g.onlineCost = store
 }
 
 func NewDynamic(workerRegistry *registry.Registry, strategy scheduler.Scheduler, model string, timeout time.Duration, maxInFlight int, retry bool, client *http.Client, logger *slog.Logger) *Gateway {
@@ -118,6 +124,10 @@ func (g *Gateway) DebugDecisions(w http.ResponseWriter) {
 	writeJSON(w, http.StatusOK, g.decisions.Snapshot())
 }
 
+func (g *Gateway) DebugOnlineCost(w http.ResponseWriter) {
+	writeJSON(w, http.StatusOK, g.onlineCost.Snapshot())
+}
+
 func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	requestID := r.Header.Get("X-Request-ID")
@@ -170,6 +180,7 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), g.timeout)
 	defer cancel()
 	record.InputTokens = approximateInputTokens(input.Messages)
+	record.UsageSource = "unknown"
 	var features *cache.RequestFeatures
 	var err error
 	if g.cacheRuntime != nil {
@@ -317,22 +328,59 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var firstToken time.Time
+	var usage api.Usage
+	var usageValid bool
 	if input.Stream {
-		firstToken, err = proxySSE(w, resp.Body)
+		firstToken, usage, usageValid, err = proxySSE(w, resp.Body)
 		record.FirstTokenAt = firstToken
 		if !firstToken.IsZero() {
 			g.metrics.ObserveTTFT(firstToken.Sub(started).Seconds())
 		}
 		record.ResponseStarted = !firstToken.IsZero()
 	} else {
+		var raw []byte
+		raw, err = io.ReadAll(resp.Body)
+		if err == nil {
+			var decoded api.ChatCompletionResponse
+			if json.Unmarshal(raw, &decoded) == nil && decoded.Usage != nil {
+				usage = *decoded.Usage
+				usageValid = validUsage(usage)
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, err = io.Copy(w, resp.Body)
+		if err == nil {
+			_, err = w.Write(raw)
+		}
 		record.ResponseStarted = true
 	}
 	if err == nil {
 		record.FinalStatus = "completed"
 		record.CompletedAt = time.Now()
+		if usageValid {
+			record.PromptTokens = usage.PromptTokens
+			record.CompletionTokens = usage.CompletionTokens
+			record.TotalTokens = usage.TotalTokens
+			record.OutputTokens = usage.CompletionTokens
+			record.UsageSource = "vllm_response"
+			record.UsageValid = true
+			record.PrefillObservationValid = !firstToken.IsZero()
+			record.DecodeObservationValid = usage.CompletionTokens > 0
+		}
+		if g.onlineCost != nil && record.SelectedWorker != "" && record.FinalStatus == "completed" {
+			ttftMS := 0.0
+			if !firstToken.IsZero() {
+				ttftMS = float64(firstToken.Sub(started)) / float64(time.Millisecond)
+			}
+			serviceMS := float64(record.CompletedAt.Sub(started)) / float64(time.Millisecond)
+			decodeMS := 0.0
+			decodeOK := false
+			if record.DecodeObservationValid && ttftMS > 0 {
+				decodeMS = serviceMS - ttftMS
+				decodeOK = decodeMS > 0
+			}
+			g.onlineCost.Add(costmodel.Observation{WorkerID: record.SelectedWorker, InstanceID: record.SelectedInstance, TTFTMS: ttftMS, ServiceMS: serviceMS, CompletionTokens: record.CompletionTokens, UsageValid: record.UsageValid, DecodeObservationMS: decodeMS, DecodeObservationOK: decodeOK, CompletedAt: record.CompletedAt})
+		}
 		if record.BackendType == string(backend.TypeMock) {
 			record.OutputTokens = input.MaxTokens
 			g.metrics.GeneratedTokens.Add(int64(input.MaxTokens))
@@ -427,10 +475,10 @@ func parseNonNegativeHeader(value string) int {
 	return parsed
 }
 
-func proxySSE(w http.ResponseWriter, body io.Reader) (time.Time, error) {
+func proxySSE(w http.ResponseWriter, body io.Reader) (time.Time, api.Usage, bool, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		return time.Time{}, fmt.Errorf("streaming unsupported")
+		return time.Time{}, api.Usage{}, false, fmt.Errorf("streaming unsupported")
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -438,24 +486,51 @@ func proxySSE(w http.ResponseWriter, body io.Reader) (time.Time, error) {
 	w.WriteHeader(http.StatusOK)
 	reader := bufio.NewReader(body)
 	var first time.Time
+	var usage api.Usage
+	var usageValid bool
 	for {
 		line, err := reader.ReadString('\n')
 		if len(line) > 0 {
 			if first.IsZero() && strings.HasPrefix(line, "data:") && !strings.Contains(line, "[DONE]") {
 				first = time.Now()
 			}
+			if parsed, ok := parseSSEUsage(line); ok {
+				usage = parsed
+				usageValid = true
+			}
 			if _, writeErr := io.WriteString(w, line); writeErr != nil {
-				return first, fmt.Errorf("write SSE: %w", writeErr)
+				return first, usage, usageValid, fmt.Errorf("write SSE: %w", writeErr)
 			}
 			flusher.Flush()
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return first, nil
+				return first, usage, usageValid, nil
 			}
-			return first, fmt.Errorf("read SSE: %w", err)
+			return first, usage, usageValid, fmt.Errorf("read SSE: %w", err)
 		}
 	}
+}
+
+func parseSSEUsage(line string) (api.Usage, bool) {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "data:") {
+		return api.Usage{}, false
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	if payload == "" || payload == "[DONE]" {
+		return api.Usage{}, false
+	}
+	var decoded api.ChatCompletionResponse
+	if json.Unmarshal([]byte(payload), &decoded) != nil || decoded.Usage == nil {
+		return api.Usage{}, false
+	}
+	usage := *decoded.Usage
+	return usage, validUsage(usage)
+}
+
+func validUsage(usage api.Usage) bool {
+	return usage.PromptTokens >= 0 && usage.CompletionTokens >= 0 && usage.TotalTokens == usage.PromptTokens+usage.CompletionTokens
 }
 
 func (g *Gateway) logResult(requestID string, started, firstToken time.Time, err error) {

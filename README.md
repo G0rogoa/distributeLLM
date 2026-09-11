@@ -25,7 +25,7 @@ Request Scheduler: cache locality, load, queue, stability
 
 - Stage 1，已完成：流式 Gateway、Mock Workers、Registry、健康跟踪、round-robin 和 least-loaded 调度、reservation、有界准入、重试、指标、生命周期记录和负载生成。
 - Stage 2，Mock 模式已完成：prompt identity、token blocks、prefix hashing、有界 Cache Index、Mock Worker LRU、cache events、prefix-aware scheduling、eviction 和 Cache Fill Reservations。
-- Stage 3，进行中：OpenAI-compatible/vLLM HTTP 后端适配器、轻量 Worker Agent、显式 tokenizer mode、vLLM 指标归一化、shadow cache affinity，以及静态多 vLLM Worker 的调度/debug/loadgen 支持。
+- Stage 3，进行中：OpenAI-compatible/vLLM HTTP 后端适配器、轻量 Worker Agent、显式 tokenizer mode、vLLM 指标归一化、shadow cache affinity、静态多 vLLM Worker 的调度/debug/loadgen 支持，以及 Stage 3D 的校准成本模型和实验数据 schema。
 - Stage 4，计划中：Node Agent、GPU Observer、cooperative Lease、Resource Policy、Elasticity Manager、reclaim/cooldown、Interference Guard、Trace Replay、reclaim-risk-aware routing 和动态伸缩实验。
 - Stage 5，可选：单节点 prefill/decode 池和本地 KV transfer。跨节点 RDMA 和多节点 serving 不是当前目标。
 
@@ -61,6 +61,20 @@ TOKENIZER_ID=example-tokenizer TOKENIZER_REVISION=local-v1 \
 CHAT_TEMPLATE_VERSION=chat-v1 \
 scripts/run-tokenizer-service.sh
 ```
+
+Stage 3D 让 `ect` 可以加载冻结的成本 profile：
+
+```bash
+go run ./cmd/controller \
+  -listen=127.0.0.1:8080 \
+  -model=example-model \
+  -scheduler=ect \
+  -tokenizer-mode=remote \
+  -tokenizer-url=http://127.0.0.1:18091 \
+  -cost-profile=artifacts/profile-a100-qwen.json
+```
+
+`cmd/calibrator` 可从离线样本生成 profile，`tools/generate_stage3d_workload.py` 生成长 prefix workload，`tools/analyze_experiment.py` 聚合 artifact 目录。真实双卡实验仍需手动确认 GPU 空闲并手动启动 vLLM；脚本不会自动选择、启动或停止 vLLM。更多说明见 `docs/cost-calibration.md`、`docs/ect-scheduler.md`、`docs/experiment-data-schema.md` 和 `docs/stage3d-experiment-plan.md`。
 
 ## 运行当前 Mock 控制面
 

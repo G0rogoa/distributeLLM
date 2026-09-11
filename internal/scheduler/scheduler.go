@@ -10,21 +10,24 @@ import (
 	"time"
 
 	"distserve/internal/cache"
+	"distserve/internal/costmodel"
 	"distserve/internal/registry"
 )
 
 var ErrNoWorker = errors.New("no eligible worker")
 
 type RequestMeta struct {
-	RequestID       string
-	Model           string
-	InputTokens     int
-	MaxOutputTokens int
-	Streaming       bool
-	ArrivalTime     time.Time
-	Deadline        time.Time
-	TenantID        string
-	Cache           *cache.RequestFeatures
+	RequestID            string
+	Model                string
+	InputTokens          int
+	MaxOutputTokens      int
+	ExpectedOutputTokens int
+	ExpectedOutputSource string
+	Streaming            bool
+	ArrivalTime          time.Time
+	Deadline             time.Time
+	TenantID             string
+	Cache                *cache.RequestFeatures
 }
 
 type Decision struct {
@@ -50,6 +53,18 @@ type ScoreBreakdown struct {
 	StalenessPenalty       float64 `json:"staleness_penalty"`
 	CapacityPenalty        float64 `json:"capacity_penalty"`
 	FillAffinityBonus      float64 `json:"fill_affinity_bonus"`
+	PrefillFixedMS         float64 `json:"prefill_fixed_ms"`
+	DecodeFixedMS          float64 `json:"decode_fixed_ms"`
+	QueueDelayMS           float64 `json:"queue_delay_ms"`
+	ReclaimRiskPenaltyMS   float64 `json:"reclaim_risk_penalty_ms"`
+	AdjustedCachedTokens   float64 `json:"adjusted_cached_tokens"`
+	UncachedTokens         float64 `json:"uncached_tokens"`
+	ShadowConfidence       float64 `json:"shadow_confidence"`
+	CostProfileSource      string  `json:"cost_profile_source"`
+	RunningSource          string  `json:"running_source"`
+	WaitingSource          string  `json:"waiting_source"`
+	ExpectedOutputTokens   int     `json:"expected_output_tokens"`
+	ExpectedOutputSource   string  `json:"expected_output_source"`
 	FinalScore             float64 `json:"final_score"`
 }
 
@@ -111,6 +126,7 @@ type PrefixAware struct {
 
 type ExpectedCompletionTime struct {
 	PrefillMSPerToken, DecodeMSPerToken, RunningMS, QueueMS, ReservationMS, RemainingTokenMS, ShadowDiscount, DegradedPenalty float64
+	Profile                                                                                                                   costmodel.Profile
 	mu                                                                                                                        sync.Mutex
 	next                                                                                                                      uint64
 }
@@ -169,7 +185,8 @@ func (s *PrefixAware) Select(ctx context.Context, request RequestMeta, workers [
 	return chosen, nil
 }
 
-func (s *ExpectedCompletionTime) Name() string { return "ect" }
+func (s *ExpectedCompletionTime) Name() string                      { return "ect" }
+func (s *ExpectedCompletionTime) ProfileSummary() costmodel.Summary { return s.profile().Summary() }
 func (s *ExpectedCompletionTime) Select(ctx context.Context, request RequestMeta, workers []registry.WorkerSnapshot) (Decision, error) {
 	if err := ctx.Err(); err != nil {
 		return Decision{}, err
@@ -187,40 +204,69 @@ func (s *ExpectedCompletionTime) Select(ctx context.Context, request RequestMeta
 		if request.Cache != nil {
 			match = request.Cache.Matches[key]
 		}
+		profile := s.profile()
 		running := worker.ReportedRunning
+		runningSource := "registry"
 		if worker.Load.RunningRequests.Valid {
 			running = int(worker.Load.RunningRequests.Value)
+			runningSource = "vllm_metrics"
 		}
 		queued := worker.ReportedQueued
+		waitingSource := "registry"
 		if worker.Load.WaitingRequests.Valid {
 			queued = int(worker.Load.WaitingRequests.Value)
+			waitingSource = "vllm_metrics"
 		}
 		inputTokens := request.InputTokens
 		if request.Cache != nil && request.Cache.TotalInputTokens > 0 {
 			inputTokens = request.Cache.TotalInputTokens
 		}
-		uncachedTokens := inputTokens - match.MatchedTokens
+		shadowConfidence := 0.0
+		if match.Evidence == cache.EvidenceMockExact {
+			shadowConfidence = 1
+		} else if match.Evidence == cache.EvidenceShadowEstimated {
+			shadowConfidence = profile.ShadowConfidence
+		}
+		adjustedCachedTokens := float64(match.MatchedTokens) * shadowConfidence
+		if adjustedCachedTokens > float64(inputTokens) {
+			adjustedCachedTokens = float64(inputTokens)
+		}
+		uncachedTokens := float64(inputTokens) - adjustedCachedTokens
 		if uncachedTokens < 0 {
 			uncachedTokens = 0
 		}
+		expectedOutput := request.ExpectedOutputTokens
+		expectedSource := request.ExpectedOutputSource
+		if expectedOutput < 1 {
+			expectedOutput = request.MaxOutputTokens
+			expectedSource = "max_tokens"
+		}
 		details := ScoreBreakdown{MatchedTokens: match.MatchedTokens}
-		details.CacheBenefit = float64(match.MatchedTokens) * s.prefillMS()
-		details.RunningPenalty = float64(running) * defaultFloat(s.RunningMS, 20)
-		details.QueuePenalty = float64(queued) * defaultFloat(s.QueueMS, 40)
-		details.ReservationPenalty = float64(worker.LocalReservations) * defaultFloat(s.ReservationMS, 20)
+		details.CostProfileSource = string(profile.Source)
+		details.RunningSource = runningSource
+		details.WaitingSource = waitingSource
+		details.ExpectedOutputTokens = expectedOutput
+		details.ExpectedOutputSource = expectedSource
+		details.ShadowConfidence = shadowConfidence
+		details.AdjustedCachedTokens = adjustedCachedTokens
+		details.UncachedTokens = uncachedTokens
+		details.CacheBenefit = adjustedCachedTokens * profile.PrefillMSPerToken
+		details.RunningPenalty = float64(running) * profile.RunningRequestMS
+		details.QueuePenalty = float64(queued) * profile.WaitingRequestMS
+		details.ReservationPenalty = float64(worker.LocalReservations) * profile.ReservationMS
 		details.RemainingTokensPenalty = float64(worker.EstimatedRemainingTokens) * defaultFloat(s.RemainingTokenMS, 0.01)
+		details.QueueDelayMS = details.RunningPenalty + details.QueuePenalty + details.ReservationPenalty
 		if match.CacheViewState == cache.CacheViewDegraded || match.CacheViewState == cache.CacheViewStale {
 			details.StalenessPenalty = defaultFloat(s.DegradedPenalty, 100)
 		}
-		if match.Evidence == cache.EvidenceShadowEstimated {
-			details.FillAffinityBonus = details.CacheBenefit * defaultFloat(s.ShadowDiscount, 0.5)
-		}
-		ect := float64(uncachedTokens)*s.prefillMS() + float64(request.MaxOutputTokens)*defaultFloat(s.DecodeMSPerToken, 1) + details.RunningPenalty + details.QueuePenalty + details.ReservationPenalty + details.RemainingTokensPenalty + details.StalenessPenalty - details.FillAffinityBonus
+		details.PrefillFixedMS = profile.PrefillFixedMS
+		details.DecodeFixedMS = profile.DecodeFixedMS
+		ect := details.QueueDelayMS + profile.PrefillFixedMS + uncachedTokens*profile.PrefillMSPerToken + profile.DecodeFixedMS + float64(expectedOutput)*profile.DecodeMSPerToken + details.RemainingTokensPenalty + details.StalenessPenalty + details.ReclaimRiskPenaltyMS
 		if ect < 0 {
 			ect = 0
 		}
 		details.FinalScore = -ect
-		reason := fmt.Sprintf("selected %s: ect_ms=%.3f, uncached_tokens=%d, matched_tokens=%d, running=%d, queued=%d, reservations=%d", worker.ID, ect, uncachedTokens, match.MatchedTokens, running, queued, worker.LocalReservations)
+		reason := fmt.Sprintf("selected %s: ect_ms=%.3f, uncached_tokens=%.1f, matched_tokens=%d, adjusted_cached_tokens=%.1f, running=%d(%s), queued=%d(%s), reservations=%d, profile_source=%s", worker.ID, ect, uncachedTokens, match.MatchedTokens, adjustedCachedTokens, running, runningSource, queued, waitingSource, worker.LocalReservations, profile.Source)
 		candidate := decision(s.Name(), worker, -ect, reason)
 		candidate.CacheMatch = match
 		candidate.ScoreDetails = details
@@ -240,7 +286,48 @@ func (s *ExpectedCompletionTime) Select(ctx context.Context, request RequestMeta
 	return chosen, nil
 }
 
-func (s *ExpectedCompletionTime) prefillMS() float64 { return defaultFloat(s.PrefillMSPerToken, 0.5) }
+func (s *ExpectedCompletionTime) prefillMS() float64 { return s.profile().PrefillMSPerToken }
+
+func (s *ExpectedCompletionTime) profile() costmodel.Profile {
+	profile := s.Profile
+	if profile.Version == 0 {
+		profile = costmodel.DefaultProfile()
+	}
+	if s.PrefillMSPerToken != 0 {
+		profile.PrefillMSPerToken = s.PrefillMSPerToken
+		profile.Source = costmodel.SourceDefault
+	}
+	if s.DecodeMSPerToken != 0 {
+		profile.DecodeMSPerToken = s.DecodeMSPerToken
+		profile.Source = costmodel.SourceDefault
+	}
+	if s.RunningMS != 0 {
+		profile.RunningRequestMS = s.RunningMS
+		profile.Source = costmodel.SourceDefault
+	}
+	if s.QueueMS != 0 {
+		profile.WaitingRequestMS = s.QueueMS
+		profile.Source = costmodel.SourceDefault
+	}
+	if s.ReservationMS != 0 {
+		profile.ReservationMS = s.ReservationMS
+		profile.Source = costmodel.SourceDefault
+	}
+	if s.ShadowDiscount != 0 {
+		profile.ShadowConfidence = s.ShadowDiscount
+		profile.Source = costmodel.SourceDefault
+	}
+	if profile.ShadowConfidence < 0 {
+		profile.ShadowConfidence = 0
+	}
+	if profile.ShadowConfidence > 1 {
+		profile.ShadowConfidence = 1
+	}
+	if profile.Source == "" {
+		profile.Source = costmodel.SourceCalibrated
+	}
+	return profile
+}
 
 func (s *LeastLoaded) Name() string { return "least-loaded" }
 

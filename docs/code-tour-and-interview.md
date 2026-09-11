@@ -8,6 +8,8 @@ Gateway 让 `internal/backend` 用 deadline context 创建 Worker HTTP request�
 
 `cmd/workeragent/main.go` 是 Stage 3 真实 backend 的伴随进程。它不运行模型推理；它注册一个已经运行的 vLLM OpenAI server，health-check 它，采集 optional normalized metrics，并在 healthy 时 heartbeat。每次启动都会得到新的 `instance_id`，因此旧 shadow affinity 和 stale heartbeats 不能描述新进程。
 
+`internal/costmodel` 保存 Stage 3D 的离线 cost profile、线性拟合 helper 和默认关闭的在线 EWMA 状态。`cmd/calibrator` 从实验样本生成 profile。`scheduler.ExpectedCompletionTime` 只读取不可变 profile 值和 request/worker snapshot；它不做网络 I/O，也不动态修改共享 profile。
+
 Metrics 在 `telemetry.Metrics` 中收集；request history 是 `lifecycle.Store` 中有界、mutex-backed ring。故障发现发生在 `Registry.RunSweeper`。Unit tests 覆盖各个 state owner；`tests/integration` 覆盖三个 Workers、round-robin spread、TTL removal 和 zero reservations。Phase 2 cache routing 应把 cache summary fields 加到 snapshots，并实现另一个 Scheduler，而不是把 cache logic 放进 Gateway。
 
 ## 面试问题和回答要点
@@ -33,3 +35,5 @@ Metrics 在 `telemetry.Metrics` 中收集；request history 是 `lifecycle.Store
 19. **什么是 ShadowEstimated cache affinity？** 一个短生命周期的真实 backend routing hint，不是 exact KV block residency 的证据。
 20. **生产化还缺什么？** Authentication、durable Registry、TLS、更丰富 histograms、distributed coordination、automatic resource control 和 overload tuning。
 21. **KV-aware scheduling 放在哪里？** 把 cache features 加到 immutable snapshots 和 request metadata，再实现新的 Scheduler；reservation semantics 保持不变。
+22. **为什么 Stage 3D 要冻结 profile？** RR、least-loaded 和 ECT 对照必须处在同一成本假设下；在线学习会引入随时间变化的策略状态，所以只作为附加实验。
+23. **为什么 shadow cache 要乘 confidence？** 真实 vLLM 没有暴露 per-prefix KV residency；shadow affinity 是弱证据，折扣后能避免把 advisory metadata 当成精确命中。

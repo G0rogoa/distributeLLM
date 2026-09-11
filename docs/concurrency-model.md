@@ -37,6 +37,8 @@ Mock Cache mutex 覆盖它的 map、LRU list、counters 和 event sequence。Eve
 
 Stage 3 增加两个小循环。`workeragent.Run` 在 command goroutine 中执行：register，使用 timeout context health-check vLLM，仅在 healthy 时发送 heartbeat，然后等待 ticker 或 root context。Heartbeat failure 使用有界 exponential backoff，每次 sleep 都 select context cancellation。Controller 拥有一个 shadow-affinity cleanup goroutine，使用 ticker，并在 Controller root context 结束时退出。
 
+Stage 3E 的 Shadow Affinity Index 使用一个 mutex 同时保护正向 directory、entry count、TTL/eviction 清理和统计。`RecordShadow` 在一次写锁内刷新一个请求的所有完整 blocks；刷新已有 `CacheKey × WorkerInstance` 不增加容量。`Match` 在一次写锁内从最长 block 向前查找，并可顺带删除遇到的过期 entry。锁内不 tokenize、hash、log 或执行 I/O。复杂度为每次 record/query `O(request full blocks)`，容量淘汰在超限时扫描 entries；默认全局上限仍为 100000 entries。
+
 真实 backend HTTP calls 使用 Gateway 提供的 request context。Backend adapter 不会在网络 I/O 时持有 Registry 或 Cache locks。SSE stream 一旦有 bytes 写给 client，就绝不重试。
 
 ## 计划中的 Stage 4 循环和归属

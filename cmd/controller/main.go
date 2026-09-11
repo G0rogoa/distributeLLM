@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"log/slog"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 
 	"distserve/internal/cache"
 	"distserve/internal/cachehttp"
+	"distserve/internal/costmodel"
 	"distserve/internal/gateway"
 	"distserve/internal/registry"
 	"distserve/internal/scheduler"
@@ -38,6 +40,12 @@ func main() {
 	chatTemplateVersion := flag.String("chat-template-version", "chat-v1", "cache identity chat template version")
 	cacheFormatVersion := flag.String("cache-format-version", "mock-kv-v1", "cache identity KV/cache format version")
 	kvLayout := flag.String("kv-layout", "mock-fp16", "cache identity KV layout, dtype, or engine setting")
+	costProfilePath := flag.String("cost-profile", "", "versioned ECT cost profile JSON")
+	allowCostProfileMismatch := flag.Bool("allow-cost-profile-mismatch", false, "allow ECT cost profile model identity mismatch")
+	allowCostProfileFallback := flag.Bool("allow-cost-profile-fallback", false, "fallback to default ECT profile when profile loading fails")
+	onlineCostLearning := flag.Bool("online-cost-learning", false, "enable bounded online EWMA cost observations")
+	onlineCostAlpha := flag.Float64("online-cost-alpha", 0.2, "online cost EWMA alpha")
+	onlineCostMinSamples := flag.Int("online-cost-min-samples", 10, "minimum online observations before an estimate is considered mature")
 	flag.Parse()
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	if *fillTTL <= 0 || *blockSize < 1 {
@@ -81,6 +89,21 @@ func main() {
 	}
 	runtime := &cache.Runtime{Builder: cache.PromptBuilder{Identity: cache.PromptIdentity{ModelID: identity.ModelID, ModelRevision: identity.ModelRevision, TokenizerID: identity.TokenizerID, TokenizerRevision: identity.TokenizerRevision, ChatTemplateVersion: identity.ChatTemplateVersion}, MaxBytes: 1 << 20}, Tokenizer: tokenizer, Identity: identity, Index: cacheIndex}
 	var strategy scheduler.Scheduler
+	var ectProfile costmodel.Profile
+	if *costProfilePath != "" {
+		ectProfile, err = costmodel.LoadFile(*costProfilePath, identity, *allowCostProfileMismatch)
+		if err != nil {
+			if !*allowCostProfileFallback {
+				logger.Error("load cost profile failed", "path", *costProfilePath, "error", err)
+				os.Exit(2)
+			}
+			ectProfile = costmodel.DefaultProfile()
+			ectProfile.Source = costmodel.SourceFallback
+			logger.Warn("falling back to default ECT cost profile", "path", *costProfilePath, "error", err)
+		} else {
+			logger.Info("loaded ECT cost profile", "path", *costProfilePath, "summary", ectProfile.Summary())
+		}
+	}
 	switch *strategyName {
 	case "round-robin":
 		strategy = &scheduler.RoundRobin{}
@@ -89,13 +112,19 @@ func main() {
 	case "prefix-aware":
 		strategy = &scheduler.PrefixAware{CacheWeight: 1, LoadWeight: 1, StalenessWeight: 1, RunningWeight: 20, ReservationWeight: 20, QueueWeight: 10, RemainingTokenWeight: 0.01, PrefillMSPerToken: 0.5, DegradedPenalty: 100, FillAffinityBonus: 25}
 	case "ect":
-		strategy = &scheduler.ExpectedCompletionTime{PrefillMSPerToken: 0.5, DecodeMSPerToken: 1, RunningMS: 20, QueueMS: 40, ReservationMS: 20, RemainingTokenMS: 0.01, ShadowDiscount: 0.5, DegradedPenalty: 100}
+		if ectProfile.Version == 0 {
+			ectProfile = costmodel.DefaultProfile()
+		}
+		strategy = &scheduler.ExpectedCompletionTime{Profile: ectProfile, DegradedPenalty: 100}
 	default:
 		logger.Error("invalid scheduler", "scheduler", *strategyName)
 		os.Exit(2)
 	}
 	gw := gateway.NewDynamic(workerRegistry, strategy, *model, *timeout, *maxInFlight, *retry, nil, logger)
 	gw.ConfigureCache(runtime, fills)
+	if *onlineCostLearning {
+		gw.ConfigureOnlineCost(costmodel.NewOnlineStore(costmodel.OnlineConfig{Enabled: true, Alpha: *onlineCostAlpha, MinSamples: *onlineCostMinSamples, MinDecodeMSPerTok: 0.01, MaxDecodeMSPerTok: 1000, MaxServiceMS: float64((*timeout).Milliseconds())}))
+	}
 	shadowAffinity := cache.NewAffinityIndex(*shadowTTL)
 	go func() {
 		for {
@@ -138,6 +167,16 @@ func main() {
 	mux.HandleFunc("GET /internal/debug/decisions", func(w http.ResponseWriter, _ *http.Request) {
 		gw.DebugDecisions(w)
 	})
+	mux.HandleFunc("GET /internal/debug/cost-profile", func(w http.ResponseWriter, _ *http.Request) {
+		if ect, ok := strategy.(*scheduler.ExpectedCompletionTime); ok {
+			writeJSON(w, http.StatusOK, ect.ProfileSummary())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"scheduler": strategy.Name(), "cost_profile": "not_applicable"})
+	})
+	mux.HandleFunc("GET /internal/debug/online-cost", func(w http.ResponseWriter, _ *http.Request) {
+		gw.DebugOnlineCost(w)
+	})
 	mux.Handle("/internal/", workerRegistry.Handler())
 	mux.Handle("GET /internal/cache/requests/{id}", gatewayRoutes)
 	mux.Handle("/", gatewayRoutes)
@@ -153,4 +192,10 @@ func main() {
 		logger.Error("controller stopped", "error", err)
 		os.Exit(1)
 	}
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
 }

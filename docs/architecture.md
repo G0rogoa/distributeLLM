@@ -81,7 +81,11 @@ Gateway prepare -> Scheduler.Select -> Registry.Reserve
 
 Cache evidence 必须显式标注。Mock cache events 产生 `MockExact` metadata。真实请求可以产生短 TTL 的 `ShadowEstimated` affinity，并绑定到 `worker_id + instance_id + cache identity`。未知或过期信息是 `Unknown`。vLLM 聚合 prefix-cache metrics 是观测信号，不证明某个具体 prefix 驻留在某个具体 Worker 上。
 
-Stage 3C 增加 remote tokenizer sidecar 和 `ect` scheduler。Sidecar 使用与 vLLM 相同的本地 tokenizer 文件，并返回真实 token IDs；Controller 使用完整 `CacheIdentity` 生成 prefix hash。Remote tokenizer 不可用、超时或 identity mismatch 时，请求降级为 cache-unaware 并继续推理。`ect` scheduler 估计每个候选 Worker 的 completion time，把 uncached prefill、decode、running/waiting、local reservation、remaining tokens 和 shadow cache benefit 放进同一个可解释 score。
+Stage 3C 增加 remote tokenizer sidecar 和 `ect` scheduler。Sidecar 使用与 vLLM 相同的本地 tokenizer 文件，并返回真实 token IDs；Controller 使用完整 `CacheIdentity` 生成 prefix hash。Remote tokenizer 不可用、超时或 identity mismatch 时，请求降级为 cache-unaware 并继续推理。
+
+Stage 3D 把 `ect` 升级为显式毫秒单位的成本模型。Controller 可以加载版本化 cost profile，并默认拒绝 identity 不匹配的 profile。Shadow affinity 仍是弱证据，所以只按 `shadow_confidence` 折扣成可扣除 cached tokens。Decision debug 会记录成本来源、running/waiting 数据来源、expected output token 来源、queue delay、uncached tokens 和 adjusted cached tokens。当前仍没有精确 vLLM KV block residency，也没有跨卡 KV transfer。
+
+Stage 3E 将 Shadow Affinity directory 的 entry 定义为 `CacheKey × WorkerInstance`。成功的真实请求会为每个完整 prefix block 写入累计 hash、累计 token 边界和同一个 TTL；查询按请求 block 从长到短进行直接 map lookup，返回第一个有效 entry。因此相同长前缀但不同尾部问题仍能产生 `ShadowEstimated`，而 identity、worker instance 和 TTL 边界保持隔离。该目录仍然只是近期路由历史，不是精确 KV residency。
 
 ## 计划中的单节点资源层
 

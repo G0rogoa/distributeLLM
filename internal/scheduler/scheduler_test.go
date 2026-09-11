@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"distserve/internal/cache"
+	"distserve/internal/costmodel"
 	"distserve/internal/registry"
 )
 
@@ -102,6 +103,86 @@ func TestExpectedCompletionTimeUsesVLLMOptionalLoadWhenPresent(t *testing.T) {
 	}
 	if len(got.Candidates) != 2 {
 		t.Fatalf("candidates=%+v", got.Candidates)
+	}
+}
+
+func TestExpectedCompletionTimeAppliesShadowConfidenceOnce(t *testing.T) {
+	s := &ExpectedCompletionTime{Profile: costmodel.Profile{Version: 1, Source: costmodel.SourceCalibrated, PrefillMSPerToken: 1, DecodeMSPerToken: 1, ShadowConfidence: 0.5, ValidTokenRange: [2]int{1, 1000}}}
+	a, b := worker("a", 0, 0), worker("b", 0, 0)
+	features := &cache.RequestFeatures{TotalInputTokens: 100, Matches: map[cache.WorkerInstanceKey]cache.PrefixMatch{
+		{WorkerID: a.ID, InstanceID: a.InstanceID}: {MatchedTokens: 80, MatchedBlocks: 5, Evidence: cache.EvidenceShadowEstimated},
+	}}
+	got, err := s.Select(context.Background(), RequestMeta{Model: "mock-llm", InputTokens: 100, MaxOutputTokens: 10, Cache: features}, []registry.WorkerSnapshot{a, b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.WorkerID != "a" || got.ScoreDetails.AdjustedCachedTokens != 40 || got.ScoreDetails.UncachedTokens != 60 {
+		t.Fatalf("got=%+v", got)
+	}
+	if got.ScoreDetails.FillAffinityBonus != 0 {
+		t.Fatalf("shadow should not be double counted: %+v", got.ScoreDetails)
+	}
+}
+
+func TestExpectedCompletionTimeClampsUncachedTokens(t *testing.T) {
+	s := &ExpectedCompletionTime{Profile: costmodel.Profile{Version: 1, Source: costmodel.SourceCalibrated, PrefillMSPerToken: 1, DecodeMSPerToken: 1, ShadowConfidence: 1, ValidTokenRange: [2]int{1, 1000}}}
+	a := worker("a", 0, 0)
+	features := &cache.RequestFeatures{TotalInputTokens: 10, Matches: map[cache.WorkerInstanceKey]cache.PrefixMatch{
+		{WorkerID: a.ID, InstanceID: a.InstanceID}: {MatchedTokens: 80, MatchedBlocks: 5, Evidence: cache.EvidenceMockExact},
+	}}
+	got, err := s.Select(context.Background(), RequestMeta{Model: "mock-llm", InputTokens: 10, MaxOutputTokens: 5, Cache: features}, []registry.WorkerSnapshot{a})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ScoreDetails.UncachedTokens != 0 {
+		t.Fatalf("uncached tokens=%v", got.ScoreDetails.UncachedTokens)
+	}
+}
+
+func TestExpectedCompletionTimeSwitchesWhenQueueExceedsCacheSaving(t *testing.T) {
+	profile := costmodel.Profile{Version: 1, Source: costmodel.SourceCalibrated, PrefillMSPerToken: 1, WaitingRequestMS: 39, ShadowConfidence: 0.5, ValidTokenRange: [2]int{1, 1000}}
+	s := &ExpectedCompletionTime{Profile: profile}
+	a, b := worker("cached", 0, 0), worker("idle", 0, 0)
+	a.Load.WaitingRequests.Valid = true
+	a.Load.WaitingRequests.Value = 1
+	features := &cache.RequestFeatures{TotalInputTokens: 100, Matches: map[cache.WorkerInstanceKey]cache.PrefixMatch{
+		{WorkerID: a.ID, InstanceID: a.InstanceID}: {MatchedTokens: 80, MatchedBlocks: 5, Evidence: cache.EvidenceShadowEstimated},
+	}}
+	request := RequestMeta{Model: "mock-llm", InputTokens: 100, Cache: features}
+	got, err := s.Select(context.Background(), request, []registry.WorkerSnapshot{a, b})
+	if err != nil || got.WorkerID != "cached" {
+		t.Fatalf("cache saving should win below boundary: got=%+v err=%v", got, err)
+	}
+	s.Profile.WaitingRequestMS = 41
+	got, err = s.Select(context.Background(), request, []registry.WorkerSnapshot{a, b})
+	if err != nil || got.WorkerID != "idle" {
+		t.Fatalf("queue should win above boundary: got=%+v err=%v", got, err)
+	}
+}
+
+func TestExpectedCompletionTimeRecordsOutputAndLoadSources(t *testing.T) {
+	s := &ExpectedCompletionTime{Profile: costmodel.Profile{Version: 1, Source: costmodel.SourceCalibrated, DecodeMSPerToken: 1, ShadowConfidence: 0.5, ValidTokenRange: [2]int{1, 1000}}}
+	a := worker("a", 0, 0)
+	got, err := s.Select(context.Background(), RequestMeta{Model: "mock-llm", InputTokens: 1, MaxOutputTokens: 16, ExpectedOutputTokens: 8, ExpectedOutputSource: "workload"}, []registry.WorkerSnapshot{a})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ScoreDetails.ExpectedOutputTokens != 8 || got.ScoreDetails.ExpectedOutputSource != "workload" {
+		t.Fatalf("details=%+v", got.ScoreDetails)
+	}
+	if got.ScoreDetails.RunningSource != "registry" || got.ScoreDetails.WaitingSource != "registry" {
+		t.Fatalf("load sources=%+v", got.ScoreDetails)
+	}
+	a.Load.RunningRequests.Valid = true
+	a.Load.RunningRequests.Value = 3
+	a.Load.WaitingRequests.Valid = true
+	a.Load.WaitingRequests.Value = 2
+	got, err = s.Select(context.Background(), RequestMeta{Model: "mock-llm", InputTokens: 1, MaxOutputTokens: 16}, []registry.WorkerSnapshot{a})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ScoreDetails.RunningSource != "vllm_metrics" || got.ScoreDetails.WaitingSource != "vllm_metrics" || got.ScoreDetails.ExpectedOutputSource != "max_tokens" {
+		t.Fatalf("details=%+v", got.ScoreDetails)
 	}
 }
 

@@ -100,8 +100,10 @@ func (m *Metrics) Handler(snapshots func() []registry.WorkerSnapshot, cacheStats
 			fmt.Fprintf(w, "distserve_shadow_affinity_hits_total %d\n", stats.Hits)
 			fmt.Fprintf(w, "distserve_shadow_affinity_misses_total %d\n", stats.Misses)
 			fmt.Fprintf(w, "distserve_shadow_affinity_expired_total %d\n", stats.Expired)
-			fmt.Fprintf(w, "distserve_shadow_affinity_evicted_total %d\n", stats.Evicted)
-			fmt.Fprintf(w, "distserve_shadow_affinity_cleared_on_instance_change_total %d\n", stats.ClearedOnInstanceChange)
+			fmt.Fprintf(w, "distserve_shadow_affinity_evictions_total %d\n", stats.Evicted)
+			fmt.Fprintf(w, "distserve_shadow_affinity_cleared_total %d\n", stats.ClearedOnInstanceChange)
+			fmt.Fprintf(w, "distserve_shadow_affinity_matched_blocks_total %d\n", stats.MatchedBlocks)
+			fmt.Fprintf(w, "distserve_shadow_affinity_matched_tokens_total %d\n", stats.MatchedTokens)
 		}
 		states := map[registry.WorkerStatus]int{}
 		if snapshots != nil {

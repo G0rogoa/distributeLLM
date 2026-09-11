@@ -6,17 +6,19 @@ import (
 )
 
 type AffinityIndex struct {
-	mu         sync.RWMutex
-	ttl        time.Duration
-	maxEntries int
-	now        func() time.Time
-	entries    map[CacheKey]map[WorkerInstanceKey]affinityEntry
-	entryCount int
-	hits       uint64
-	misses     uint64
-	expired    uint64
-	evicted    uint64
-	cleared    uint64
+	mu            sync.RWMutex
+	ttl           time.Duration
+	maxEntries    int
+	now           func() time.Time
+	entries       map[CacheKey]map[WorkerInstanceKey]affinityEntry
+	entryCount    int
+	hits          uint64
+	misses        uint64
+	expired       uint64
+	evicted       uint64
+	cleared       uint64
+	matchedBlocks uint64
+	matchedTokens uint64
 }
 
 type affinityEntry struct {
@@ -32,6 +34,8 @@ type AffinityStats struct {
 	Expired                 uint64 `json:"expired"`
 	Evicted                 uint64 `json:"evicted"`
 	ClearedOnInstanceChange uint64 `json:"cleared_on_instance_change"`
+	MatchedBlocks           uint64 `json:"matched_blocks"`
+	MatchedTokens           uint64 `json:"matched_tokens"`
 }
 
 func NewAffinityIndex(ttl time.Duration) *AffinityIndex {
@@ -56,19 +60,25 @@ func (index *AffinityIndex) RecordShadow(worker WorkerInstanceKey, identity Cach
 	if err != nil {
 		return
 	}
-	last := blocks[len(blocks)-1]
-	key := CacheKey{IdentityHash: identityHash, PrefixHash: last.PrefixHash}
-	entry := affinityEntry{tokens: totalTokens, blocks: len(blocks), expiresAt: index.now().Add(index.ttl)}
+	expiresAt := index.now().Add(index.ttl)
 	index.mu.Lock()
-	workers := index.entries[key]
-	if workers == nil {
-		workers = map[WorkerInstanceKey]affinityEntry{}
-		index.entries[key] = workers
+	matchedTokens := 0
+	for blockIndex, block := range blocks {
+		if block.Index != blockIndex || block.TokenCount <= 0 {
+			break
+		}
+		matchedTokens += block.TokenCount
+		key := CacheKey{IdentityHash: identityHash, PrefixHash: block.PrefixHash}
+		workers := index.entries[key]
+		if workers == nil {
+			workers = map[WorkerInstanceKey]affinityEntry{}
+			index.entries[key] = workers
+		}
+		if _, ok := workers[worker]; !ok {
+			index.entryCount++
+		}
+		workers[worker] = affinityEntry{tokens: matchedTokens, blocks: blockIndex + 1, expiresAt: expiresAt}
 	}
-	if _, ok := workers[worker]; !ok {
-		index.entryCount++
-	}
-	workers[worker] = entry
 	index.evictLocked()
 	index.mu.Unlock()
 }
@@ -82,20 +92,36 @@ func (index *AffinityIndex) Match(worker WorkerInstanceKey, identity CacheIdenti
 	if err != nil {
 		return match
 	}
-	last := blocks[len(blocks)-1]
-	key := CacheKey{IdentityHash: identityHash, PrefixHash: last.PrefixHash}
 	now := index.now()
-	index.mu.RLock()
-	entry, ok := index.entries[key][worker]
-	index.mu.RUnlock()
-	if !ok || !entry.expiresAt.After(now) {
-		index.mu.Lock()
+	index.mu.Lock()
+	var entry affinityEntry
+	found := false
+	for blockIndex := len(blocks) - 1; blockIndex >= 0; blockIndex-- {
+		key := CacheKey{IdentityHash: identityHash, PrefixHash: blocks[blockIndex].PrefixHash}
+		candidate, ok := index.entries[key][worker]
+		if !ok {
+			continue
+		}
+		if !candidate.expiresAt.After(now) {
+			delete(index.entries[key], worker)
+			index.entryCount--
+			index.expired++
+			if len(index.entries[key]) == 0 {
+				delete(index.entries, key)
+			}
+			continue
+		}
+		entry, found = candidate, true
+		break
+	}
+	if !found {
 		index.misses++
 		index.mu.Unlock()
 		return match
 	}
-	index.mu.Lock()
 	index.hits++
+	index.matchedBlocks += uint64(entry.blocks)
+	index.matchedTokens += uint64(entry.tokens)
 	index.mu.Unlock()
 	match.Evidence = EvidenceShadowEstimated
 	match.MatchedBlocks = entry.blocks
@@ -153,7 +179,7 @@ func (index *AffinityIndex) CleanupExpired(limit int) int {
 func (index *AffinityIndex) Stats() AffinityStats {
 	index.mu.RLock()
 	defer index.mu.RUnlock()
-	return AffinityStats{Entries: index.entryCount, Hits: index.hits, Misses: index.misses, Expired: index.expired, Evicted: index.evicted, ClearedOnInstanceChange: index.cleared}
+	return AffinityStats{Entries: index.entryCount, Hits: index.hits, Misses: index.misses, Expired: index.expired, Evicted: index.evicted, ClearedOnInstanceChange: index.cleared, MatchedBlocks: index.matchedBlocks, MatchedTokens: index.matchedTokens}
 }
 
 func (index *AffinityIndex) SetNowForTest(now func() time.Time) {
