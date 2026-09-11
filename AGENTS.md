@@ -25,3 +25,9 @@
 - Start with one free GPU and expand gradually. Do not reserve more GPUs than a test needs, and release all project processes after the test.
 - Do not expose services publicly, create new tunnels, or alter the existing relay. Bind test services to loopback unless explicitly instructed otherwise.
 - Do not automatically push, deploy, start long-running GPU jobs, or modify the remote environment without explicit confirmation.
+
+## Standing GitHub push authorization
+
+- The maintainer authorizes normal, non-force pushes to `origin/phase-2` for commits created and tested for the active DistServe task.
+- This authorization does not permit force-push, history rewriting, branch deletion, pushing unrelated local changes, or publishing raw `remote-results/`, credentials, private configuration, or user process data.
+- Summarize the commits and tests before pushing. If the target branch, remote, repository visibility, or data scope changes, obtain fresh explicit confirmation.
